@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional, List
 from dataclasses import dataclass
 from enum import Enum
 import time
+import contextlib
 
 from telegram import (
     Update,
@@ -42,7 +43,9 @@ class BotConfig:
     typing_delay: float = 0.5
     error_retry_count: int = 3
     error_retry_delay: float = 1.0
+    graph_timeout: float = 60.0  # Timeout for graph operations
     allowed_users: Optional[List[int]] = None  # None = allow all
+    checkpoint_ns: str = "prod-bot"  # Checkpoint namespace
     
     def __post_init__(self):
         if not self.token:
@@ -54,6 +57,8 @@ config = BotConfig(
     app_module=os.environ.get("APP_MODULE", "graph_app"),
     app_name=os.environ.get("APP_NAME", "APP"),
     log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    graph_timeout=float(os.environ.get("GRAPH_TIMEOUT", "60.0")),
+    checkpoint_ns=os.environ.get("CHECKPOINT_NS", "prod-bot"),
     allowed_users=None  # Could parse from env: os.environ.get("ALLOWED_USERS", "").split(",")
 )
 
@@ -175,42 +180,76 @@ async def check_authorization(update: Update) -> bool:
     return True
 
 # =========================
-# Helpers
+# Enhanced Graph Helpers
 # =========================
-async def invoke_graph_with_retry(
-    chat_id: int, 
-    text: str,
-    max_retries: int = 3
-) -> Dict[str, Any]:
-    """Invoke graph with retry logic."""
-    state = {"chat_id": chat_id, "input_text": text}
-    
-    # LangGraph checkpointer требует хотя бы configurable.thread_id
-    cfg = {
+def get_config_for_chat(chat_id: int, additional_config: Optional[Dict] = None) -> Dict[str, Any]:
+    """Generate configuration for LangGraph with optional extensions."""
+    base_config = {
         "configurable": {
             "thread_id": f"tg-{chat_id}",
-            # опционально: пространство имён, если несколько ботов/инстансов
-            "checkpoint_ns": os.getenv("CHECKPOINT_NS", "prod-bot"),
+            "checkpoint_ns": config.checkpoint_ns,
+            "user_id": str(chat_id),
+            "session_type": "telegram_bot",
+            "bot_version": "3.1",
         }
     }
     
+    if additional_config:
+        base_config["configurable"].update(additional_config)
+    
+    return base_config
+
+async def invoke_graph_with_retry(
+    chat_id: int, 
+    text: str,
+    max_retries: int = 3,
+    timeout: float = None
+) -> Dict[str, Any]:
+    """Invoke graph with retry logic and proper error handling."""
+    if timeout is None:
+        timeout = config.graph_timeout
+    
+    state = {"chat_id": chat_id, "input_text": text}
+    cfg = get_config_for_chat(chat_id)
+    
+    last_error = None
+    
     for attempt in range(max_retries):
         try:
-            # Run in executor to avoid blocking
-            loop = asyncio.get_running_loop()
-            result: Dict[str, Any] = await loop.run_in_executor(
-                None, 
-                lambda: APP.invoke(state, config=cfg)
-            )
-            return result or {}
+            logger.info(f"Graph invoke attempt {attempt + 1}/{max_retries} for chat_id: {chat_id}")
             
+            # Run in executor to avoid blocking with timeout
+            loop = asyncio.get_running_loop()
+            result: Dict[str, Any] = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, 
+                    lambda: APP.invoke(state, config=cfg)
+                ),
+                timeout=timeout
+            )
+            
+            if result:
+                logger.info(f"Successfully invoked graph for chat_id: {chat_id}")
+                return result
+            else:
+                logger.warning(f"Empty result from graph for chat_id: {chat_id}")
+                return {}
+                
+        except asyncio.TimeoutError as e:
+            last_error = e
+            logger.warning(f"Timeout on attempt {attempt + 1} for chat_id: {chat_id}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)  # exponential backoff
+                
         except Exception as e:
-            logger.error(f"Graph invoke attempt {attempt + 1} failed: {e}")
-            if attempt == max_retries - 1:
-                raise
-            await asyncio.sleep(config.error_retry_delay * (attempt + 1))
+            last_error = e
+            logger.error(f"Error on attempt {attempt + 1} for chat_id: {chat_id}: {str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)  # exponential backoff
     
-    return {}
+    # Если все попытки неудачны
+    logger.error(f"All {max_retries} attempts failed for chat_id: {chat_id}. Last error: {last_error}")
+    raise last_error if last_error else Exception("Unknown error occurred")
 
 async def send_long_message(
     update: Update,
@@ -282,6 +321,9 @@ async def send_long_message(
 
 def detect_llm_choice_needed(reply: str) -> bool:
     """Check if response indicates LLM choice is needed."""
+    if not reply:
+        return False
+        
     markers = [
         # EN
         "Structured prompt ready",
@@ -289,12 +331,24 @@ def detect_llm_choice_needed(reply: str) -> bool:
         "→ /llm",
         "→ /run",
         "user decision",
+        "select llm",
+        "choose model",
+        
         # RU (совпадает с сообщениями из графа)
         "Структурированный промпт готов",
         "Выберите LLM для генерации кода",
         "Использовать текущую",
+        "выбрать модель",
+        "выберите llm",
+        
+        # Дополнительные паттерны
+        "model selection",
+        "выбор модели"
     ]
-    return any(marker in reply for marker in markers)
+    
+    # Приводим к нижнему регистру для более надёжного поиска
+    reply_lower = reply.lower()
+    return any(marker.lower() in reply_lower for marker in markers)
 
 async def send_file_if_exists(
     context: ContextTypes.DEFAULT_TYPE,
@@ -364,14 +418,17 @@ async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     
     try:
-        # Test graph availability
+        # Test graph availability with short timeout
         test_result = await invoke_graph_with_retry(
             update.effective_chat.id,
             "/model",
-            max_retries=1
+            max_retries=1,
+            timeout=10.0
         )
         graph_status = "✅ Operational" if test_result else "⚠️ Limited"
-    except:
+    except asyncio.TimeoutError:
+        graph_status = "⏱️ Slow response"
+    except Exception:
         graph_status = "❌ Unavailable"
     
     status_text = (
@@ -379,7 +436,9 @@ async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🤖 Bot: ✅ Running\n"
         f"🧠 Graph Engine: {graph_status}\n"
         f"📊 Log Level: {config.log_level}\n"
-        f"🔌 Module: {config.app_module}.{config.app_name}"
+        f"🔌 Module: {config.app_module}.{config.app_name}\n"
+        f"⏱️ Timeout: {config.graph_timeout}s\n"
+        f"🏷️ Namespace: {config.checkpoint_ns}"
     )
     
     await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
@@ -454,7 +513,7 @@ async def process_text(
     chat_id: int,
     payload: str
 ) -> None:
-    """Process text through graph engine."""
+    """Process text through graph engine with enhanced error handling."""
     if not payload:
         await message.reply_text(
             f"{Emoji.WARNING} Empty message. Send a command or task description."
@@ -462,10 +521,20 @@ async def process_text(
         return
     
     # Show typing indicator
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    typing_task = None
+    try:
+        typing_task = asyncio.create_task(
+            context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        )
+    except Exception as e:
+        logger.warning(f"Failed to send typing indicator: {e}")
     
     # Send loading message
-    loading = await message.reply_text(f"{Emoji.LOADING} Processing request...")
+    loading = None
+    try:
+        loading = await message.reply_text(f"{Emoji.LOADING} Processing request...")
+    except Exception as e:
+        logger.error(f"Failed to send loading message: {e}")
     
     try:
         # Invoke graph
@@ -475,18 +544,33 @@ async def process_text(
         
         logger.info(f"Graph processed in {elapsed:.2f}s for chat {chat_id}")
         
+    except asyncio.TimeoutError:
+        logger.warning(f"Graph timeout for chat {chat_id}")
+        if loading:
+            with contextlib.suppress(Exception):
+                await loading.delete()
+        
+        await message.reply_text(
+            f"{Emoji.WARNING} Request timed out after {config.graph_timeout}s\n"
+            "The operation may be too complex. Try simplifying your request."
+        )
+        return
+        
     except Exception as e:
         logger.exception(f"Graph invoke error for chat {chat_id}")
-        try:
-            await loading.delete()
-        except:
-            pass
+        if loading:
+            with contextlib.suppress(Exception):
+                await loading.delete()
         
         error_msg = str(e)
         if "api" in error_msg.lower():
             error_detail = "API connection issue"
         elif "timeout" in error_msg.lower():
             error_detail = "Request timeout"
+        elif "rate" in error_msg.lower():
+            error_detail = "Rate limit exceeded"
+        elif "key" in error_msg.lower():
+            error_detail = "API key issue"
         else:
             error_detail = "Processing failed"
         
@@ -496,11 +580,17 @@ async def process_text(
         )
         return
     
+    finally:
+        # Cancel typing task
+        if typing_task:
+            typing_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await typing_task
+    
     # Delete loading message
-    try:
-        await loading.delete()
-    except:
-        pass
+    if loading:
+        with contextlib.suppress(Exception):
+            await loading.delete()
     
     # Extract response
     reply = result.get("reply_text", "Completed.")
@@ -543,6 +633,40 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error(f"Failed to send error message: {e}")
 
 # =========================
+# Health Check & Monitoring
+# =========================
+async def health_check() -> bool:
+    """Perform basic health check of the bot systems."""
+    try:
+        # Test graph import
+        if not APP:
+            return False
+        
+        # Could add more checks here (database, APIs, etc.)
+        return True
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return False
+
+async def periodic_cleanup():
+    """Periodic cleanup task."""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # Run every hour
+            logger.info("Running periodic cleanup...")
+            
+            # Here you could add cleanup logic:
+            # - Clear old checkpoints
+            # - Clean temporary files
+            # - Log statistics
+            
+        except asyncio.CancelledError:
+            logger.info("Cleanup task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Cleanup task error: {e}")
+
+# =========================
 # Bot Setup
 # =========================
 async def post_init(application: Application) -> None:
@@ -564,10 +688,19 @@ async def post_init(application: Application) -> None:
     
     await application.bot.set_my_commands(commands)
     logger.info("Bot commands registered")
+    
+    # Start cleanup task
+    application.create_task(periodic_cleanup())
+    logger.info("Periodic cleanup task started")
 
 async def shutdown(application: Application) -> None:
     """Cleanup on shutdown."""
     logger.info("Bot shutting down...")
+    
+    # Cancel all tasks
+    for task in asyncio.all_tasks():
+        if not task.done():
+            task.cancel()
 
 # =========================
 # Main Application
@@ -576,7 +709,7 @@ def build_application() -> Application:
     """Build the Telegram bot application."""
     builder = ApplicationBuilder().token(config.token)
     
-    # Configure connection pool
+    # Configure connection pool with more robust settings
     builder.connection_pool_size(8)
     builder.connect_timeout(30.0)
     builder.read_timeout(30.0)
@@ -612,6 +745,13 @@ def build_application() -> Application:
 async def main() -> None:
     """Main entry point."""
     logger.info(f"Starting bot with module: {config.app_module}.{config.app_name}")
+    logger.info(f"Checkpoint namespace: {config.checkpoint_ns}")
+    logger.info(f"Graph timeout: {config.graph_timeout}s")
+    
+    # Health check before starting
+    if not await health_check():
+        logger.critical("Health check failed, aborting startup")
+        sys.exit(1)
     
     # Build application
     app = build_application()
@@ -631,8 +771,12 @@ async def main() -> None:
         stop_event = asyncio.Event()
         
         # Handle signals
+        def signal_handler(signum, frame):
+            logger.info(f"Received signal {signum}")
+            stop_event.set()
+        
         for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, lambda s, f: stop_event.set())
+            signal.signal(sig, signal_handler)
         
         await stop_event.wait()
         
@@ -643,7 +787,7 @@ async def main() -> None:
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
-        logger.info("Bot stopped")
+        logger.info("Bot stopped gracefully")
 
 # =========================
 # Entry Point
