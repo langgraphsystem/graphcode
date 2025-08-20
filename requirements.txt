@@ -1,7 +1,18 @@
+# базовые инструменты сборки (ускоряют и предотвращают ошибки)
+pip>=24.2
+setuptools>=70.0.0
+wheel>=0.44.0
+
+# бот
 python-telegram-bot==20.7
-langgraph==0.2.36
-langchain==0.2.18
-openai==1.47.0
-python-dotenv==1.0.1
-pydantic==2.9.2
-tenacity==8.2.3
+openai>=1.43.0
+
+# langgraph + langchain (совместимые между собой)
+langgraph>=0.2.39
+langchain>=0.2.16
+
+# утилиты
+python-dotenv>=1.0.1
+pydantic>=2.7.1
+tenacity>=8.2.3
+
