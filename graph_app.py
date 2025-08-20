@@ -1,4 +1,3 @@
-```python
 from __future__ import annotations
 import os, re, time, hashlib, sqlite3, zipfile, json, logging
 from pathlib import Path
@@ -766,4 +765,4 @@ def build_app():
 APP = build_app()
 __all__ = ['APP', 'DEFAULT_MODEL', 'VALID_MODELS']
 logger.info(f"Graph app initialized. Model: GPT-5 only. Output dir: {OUTPUT_DIR}")
-```
+
