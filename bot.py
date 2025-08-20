@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 import time
 import contextlib
+import traceback
 
 from telegram import (
     Update,
@@ -43,9 +44,10 @@ class BotConfig:
     typing_delay: float = 0.5
     error_retry_count: int = 3
     error_retry_delay: float = 1.0
-    graph_timeout: float = 60.0  # Timeout for graph operations
-    allowed_users: Optional[List[int]] = None  # None = allow all
-    checkpoint_ns: str = "prod-bot"  # Checkpoint namespace
+    graph_timeout: float = 60.0
+    allowed_users: Optional[List[int]] = None
+    checkpoint_ns: str = "prod-bot"
+    safe_mode: bool = False  # Добавляем безопасный режим
     
     def __post_init__(self):
         if not self.token:
@@ -59,7 +61,8 @@ config = BotConfig(
     log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     graph_timeout=float(os.environ.get("GRAPH_TIMEOUT", "60.0")),
     checkpoint_ns=os.environ.get("CHECKPOINT_NS", "prod-bot"),
-    allowed_users=None  # Could parse from env: os.environ.get("ALLOWED_USERS", "").split(",")
+    safe_mode=os.environ.get("BOT_SAFE_MODE", "false").lower() == "true",
+    allowed_users=None
 )
 
 # =========================
@@ -80,15 +83,41 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.INFO)
 
 # =========================
-# Dynamic Import of Graph APP
+# Safe Graph Import
 # =========================
-try:
-    _mod = importlib.import_module(config.app_module)
-    APP = getattr(_mod, config.app_name)
-    logger.info(f"Successfully imported {config.app_name} from {config.app_module}")
-except Exception as e:
-    logger.critical(f"Failed to import graph APP from {config.app_module}.{config.app_name}: {e}")
-    raise RuntimeError(f"Failed to import graph APP: {e}")
+APP = None
+GRAPH_ERROR = None
+
+def safe_import_graph():
+    """Безопасный импорт graph приложения."""
+    global APP, GRAPH_ERROR
+    
+    try:
+        logger.info(f"Попытка импорта {config.app_module}.{config.app_name}...")
+        _mod = importlib.import_module(config.app_module)
+        APP = getattr(_mod, config.app_name)
+        logger.info(f"✅ Успешно импортирован {config.app_name} из {config.app_module}")
+        return True
+    except ImportError as e:
+        GRAPH_ERROR = f"Модуль не найден: {e}"
+        logger.error(f"❌ Ошибка импорта модуля: {e}")
+        return False
+    except AttributeError as e:
+        GRAPH_ERROR = f"Объект {config.app_name} не найден в {config.app_module}: {e}"
+        logger.error(f"❌ Ошибка доступа к объекту: {e}")
+        return False
+    except Exception as e:
+        GRAPH_ERROR = f"Неожиданная ошибка при импорте: {e}"
+        logger.error(f"❌ Критическая ошибка импорта: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return False
+
+# Попытка импорта при запуске
+GRAPH_AVAILABLE = safe_import_graph()
+
+if not GRAPH_AVAILABLE:
+    logger.warning(f"⚠️ Graph недоступен: {GRAPH_ERROR}")
+    logger.warning("🔄 Бот будет работать в ограниченном режиме")
 
 # =========================
 # UI Constants
@@ -110,6 +139,10 @@ HELP_TEXT = """
 **Basic Commands:**
 • `/start` — Initialize bot
 • `/help` — Show this help
+• `/status` — Show system status
+• `/diagnostics` — Run diagnostics
+
+**Code Generation Commands:**
 • `/create <file>` — Create/activate file
 • `/switch <file>` — Switch to existing file  
 • `/files` — List all files
@@ -119,27 +152,30 @@ HELP_TEXT = """
 • `/reset` — Reset state
 • `/download [filter]` — Download files as archive
 
-**How to Use:**
-1. Start with `/create app.py`
-2. Send your task description
-3. Bot prepares structured prompt via adapter
-4. Choose LLM: GPT-5 or Claude Opus 4.1
-5. Code is generated and saved
-
 **Available Models:**
 • GPT-5 (default)
 • Claude Opus 4.1 (`claude-opus-4-1-20250805`)
-
-**Download Options:**
-• `/download` — all files
-• `/download latest` — only latest versions
-• `/download versions` — only versioned files
-• `/download <filename>` — specific file
 """
 
-# Dynamic keyboard generation
+def get_status_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для статуса."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(text="🔄 Retry Graph", callback_data="retry_graph"),
+            InlineKeyboardButton(text="📊 Diagnostics", callback_data="run_diagnostics"),
+        ],
+        [
+            InlineKeyboardButton(text=f"{Emoji.INFO} Help", callback_data="cmd_help"),
+        ],
+    ])
+
 def get_llm_keyboard() -> InlineKeyboardMarkup:
     """Generate LLM selection keyboard."""
+    if not GRAPH_AVAILABLE:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(text="❌ Graph not available", callback_data="graph_error")]
+        ])
+    
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(text="🧠 GPT-5", callback_data="choose_gpt5"),
@@ -180,7 +216,7 @@ async def check_authorization(update: Update) -> bool:
     return True
 
 # =========================
-# Enhanced Graph Helpers
+# Graph Integration
 # =========================
 def get_config_for_chat(chat_id: int, additional_config: Optional[Dict] = None) -> Dict[str, Any]:
     """Generate configuration for LangGraph with optional extensions."""
@@ -206,6 +242,9 @@ async def invoke_graph_with_retry(
     timeout: float = None
 ) -> Dict[str, Any]:
     """Invoke graph with retry logic and proper error handling."""
+    if not GRAPH_AVAILABLE:
+        raise RuntimeError(f"Graph недоступен: {GRAPH_ERROR}")
+    
     if timeout is None:
         timeout = config.graph_timeout
     
@@ -233,24 +272,94 @@ async def invoke_graph_with_retry(
                 return result
             else:
                 logger.warning(f"Empty result from graph for chat_id: {chat_id}")
-                return {}
+                return {"reply_text": "Получен пустой результат от Graph."}
                 
         except asyncio.TimeoutError as e:
             last_error = e
             logger.warning(f"Timeout on attempt {attempt + 1} for chat_id: {chat_id}")
             if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)  # exponential backoff
+                await asyncio.sleep(2 ** attempt)
                 
         except Exception as e:
             last_error = e
             logger.error(f"Error on attempt {attempt + 1} for chat_id: {chat_id}: {str(e)}")
             if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)  # exponential backoff
+                await asyncio.sleep(2 ** attempt)
     
     # Если все попытки неудачны
     logger.error(f"All {max_retries} attempts failed for chat_id: {chat_id}. Last error: {last_error}")
     raise last_error if last_error else Exception("Unknown error occurred")
 
+# =========================
+# Diagnostics
+# =========================
+async def run_diagnostics() -> str:
+    """Запуск диагностики системы."""
+    results = []
+    
+    # 1. Проверка переменных окружения
+    results.append("🔍 **ДИАГНОСТИКА СИСТЕМЫ**\n")
+    
+    env_checks = {
+        'TELEGRAM_BOT_TOKEN': bool(os.getenv('TELEGRAM_BOT_TOKEN')),
+        'OPENAI_API_KEY': bool(os.getenv('OPENAI_API_KEY')),
+        'ANTHROPIC_API_KEY': bool(os.getenv('ANTHROPIC_API_KEY')),
+    }
+    
+    results.append("🔑 **Переменные окружения:**")
+    for var, status in env_checks.items():
+        emoji = "✅" if status else "❌"
+        results.append(f"{emoji} {var}")
+    
+    # 2. Проверка файлов
+    file_checks = {
+        'graph_app.py': Path('graph_app.py').exists(),
+        'config/prompt_adapter.json': Path('config/prompt_adapter.json').exists(),
+        'prompt_adapter.json': Path('prompt_adapter.json').exists(),
+    }
+    
+    results.append("\n📁 **Файлы:**")
+    for file, exists in file_checks.items():
+        emoji = "✅" if exists else "❌"
+        results.append(f"{emoji} {file}")
+    
+    # 3. Проверка Graph
+    results.append(f"\n🧠 **Graph Engine:**")
+    if GRAPH_AVAILABLE:
+        results.append("✅ Доступен и импортирован")
+    else:
+        results.append(f"❌ Недоступен: {GRAPH_ERROR}")
+    
+    # 4. Проверка API
+    results.append(f"\n🔌 **API тесты:**")
+    
+    # OpenAI тест
+    try:
+        if os.getenv('OPENAI_API_KEY'):
+            from openai import OpenAI
+            client = OpenAI()
+            results.append("✅ OpenAI клиент инициализирован")
+        else:
+            results.append("⚠️ OpenAI ключ не установлен")
+    except Exception as e:
+        results.append(f"❌ OpenAI ошибка: {str(e)[:50]}")
+    
+    # Anthropic тест
+    try:
+        if os.getenv('ANTHROPIC_API_KEY'):
+            from anthropic import Anthropic
+            client = Anthropic()
+            results.append("✅ Anthropic клиент инициализирован")
+        else:
+            results.append("⚠️ Anthropic ключ не установлен")
+    except Exception as e:
+        results.append(f"❌ Anthropic ошибка: {str(e)[:50]}")
+    
+    return "\n".join(results)
+
+# =========================
+# Message Handling
+# =========================
 async def send_long_message(
     update: Update,
     text: str,
@@ -264,9 +373,6 @@ async def send_long_message(
     msg = update.effective_message
     limit = config.max_message_length
     
-    # Clean up text for Telegram
-    text = text.replace("```", "```\n") if "```" in text else text
-    
     if len(text) <= limit:
         try:
             await msg.reply_text(
@@ -277,7 +383,6 @@ async def send_long_message(
             )
         except TelegramError as e:
             logger.error(f"Failed to send message: {e}")
-            # Retry without parse mode
             await msg.reply_text(
                 text,
                 disable_web_page_preview=True,
@@ -286,20 +391,8 @@ async def send_long_message(
         return
     
     # Split into chunks
-    chunks = []
-    current_chunk = ""
+    chunks = [text[i:i+limit] for i in range(0, len(text), limit)]
     
-    for line in text.split('\n'):
-        if len(current_chunk) + len(line) + 1 > limit:
-            chunks.append(current_chunk)
-            current_chunk = line
-        else:
-            current_chunk += '\n' + line if current_chunk else line
-    
-    if current_chunk:
-        chunks.append(current_chunk)
-    
-    # Send chunks
     for i, chunk in enumerate(chunks):
         is_last = i == len(chunks) - 1
         try:
@@ -317,70 +410,7 @@ async def send_long_message(
             )
         
         if not is_last:
-            await asyncio.sleep(0.1)  # Small delay between chunks
-
-def detect_llm_choice_needed(reply: str) -> bool:
-    """Check if response indicates LLM choice is needed."""
-    if not reply:
-        return False
-        
-    markers = [
-        # EN
-        "Structured prompt ready",
-        "Choose LLM for code generation",
-        "→ /llm",
-        "→ /run",
-        "user decision",
-        "select llm",
-        "choose model",
-        
-        # RU (совпадает с сообщениями из графа)
-        "Структурированный промпт готов",
-        "Выберите LLM для генерации кода",
-        "Использовать текущую",
-        "выбрать модель",
-        "выберите llm",
-        
-        # Дополнительные паттерны
-        "model selection",
-        "выбор модели"
-    ]
-    
-    # Приводим к нижнему регистру для более надёжного поиска
-    reply_lower = reply.lower()
-    return any(marker.lower() in reply_lower for marker in markers)
-
-async def send_file_if_exists(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    file_path: str
-) -> bool:
-    """Send file if it exists."""
-    try:
-        path = Path(file_path)
-        if not path.exists():
-            return False
-        
-        # Check file size
-        if path.stat().st_size > 50 * 1024 * 1024:  # 50MB limit
-            await context.bot.send_message(
-                chat_id,
-                f"{Emoji.WARNING} File too large to send: {path.name}"
-            )
-            return False
-        
-        with open(path, 'rb') as f:
-            await context.bot.send_document(
-                chat_id,
-                document=f,
-                filename=path.name,
-                caption=f"📦 Archive: {path.name}"
-            )
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to send file: {e}")
-        return False
+            await asyncio.sleep(0.1)
 
 # =========================
 # Command Handlers
@@ -391,224 +421,216 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     
     user = update.effective_user
+    status_emoji = "✅" if GRAPH_AVAILABLE else "⚠️"
+    status_text = "Полная функциональность" if GRAPH_AVAILABLE else "Ограниченный режим"
+    
     welcome_text = (
         f"{Emoji.OK} Welcome{f', {user.first_name}' if user else ''}!\n\n"
-        f"{Emoji.ROBOT} I'm an AI code generator powered by LangGraph.\n"
-        "I use GPT-5 adapter with your choice of GPT-5 or Claude for generation.\n\n"
-        "Send /help for commands or start with:\n"
-        "→ `/create app.py` to begin coding"
+        f"{Emoji.ROBOT} AI Code Generator powered by LangGraph\n"
+        f"Статус: {status_emoji} {status_text}\n\n"
+        "Доступные команды:\n"
+        "• `/help` - полная справка\n"
+        "• `/status` - статус системы\n"
+        "• `/diagnostics` - диагностика проблем\n"
     )
     
-    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
+    if GRAPH_AVAILABLE:
+        welcome_text += "\n• `/create app.py` - начать кодирование"
+    else:
+        welcome_text += f"\n⚠️ Graph недоступен: {GRAPH_ERROR[:100]}"
+    
+    await update.message.reply_text(welcome_text)
 
 async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command."""
     if not await check_authorization(update):
         return
     
-    await update.message.reply_text(
-        HELP_TEXT,
+    help_text = HELP_TEXT
+    if not GRAPH_AVAILABLE:
+        help_text += f"\n\n⚠️ **Внимание:** Graph Engine недоступен.\n"
+        help_text += f"Причина: {GRAPH_ERROR}\n"
+        help_text += "Команды генерации кода не работают.\n"
+        help_text += "Используйте `/diagnostics` для проверки."
+    
+    await send_long_message(
+        update,
+        help_text,
         parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True
     )
 
 async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /status command - show bot status."""
+    """Handle /status command."""
     if not await check_authorization(update):
         return
     
-    try:
-        # Test graph availability with short timeout
-        test_result = await invoke_graph_with_retry(
-            update.effective_chat.id,
-            "/model",
-            max_retries=1,
-            timeout=10.0
-        )
-        graph_status = "✅ Operational" if test_result else "⚠️ Limited"
-    except asyncio.TimeoutError:
-        graph_status = "⏱️ Slow response"
-    except Exception:
-        graph_status = "❌ Unavailable"
-    
     status_text = (
-        f"**Bot Status**\n\n"
+        f"**📊 BOT STATUS**\n\n"
         f"🤖 Bot: ✅ Running\n"
-        f"🧠 Graph Engine: {graph_status}\n"
+        f"🧠 Graph Engine: {('✅ Available' if GRAPH_AVAILABLE else '❌ Unavailable')}\n"
         f"📊 Log Level: {config.log_level}\n"
         f"🔌 Module: {config.app_module}.{config.app_name}\n"
         f"⏱️ Timeout: {config.graph_timeout}s\n"
-        f"🏷️ Namespace: {config.checkpoint_ns}"
+        f"🏷️ Namespace: {config.checkpoint_ns}\n"
     )
     
-    await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
-
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline button callbacks."""
-    query = update.callback_query
-    if not query:
-        return
+    if not GRAPH_AVAILABLE:
+        status_text += f"\n❌ **Graph Error:**\n{GRAPH_ERROR}"
     
-    # Check authorization
-    if not await check_authorization(update):
-        await query.answer("Unauthorized", show_alert=True)
-        return
-    
-    await query.answer()
-    
-    chat_id = update.effective_chat.id
-    data = query.data or ""
-    
-    # Map callback data to commands
-    command_map = {
-        "cmd_help": "/help",
-        "cmd_files": "/files",
-        "cmd_model": "/model",
-        "choose_gpt5": "/llm gpt-5",
-        "choose_claude": "/llm claude-opus-4-1-20250805",
-        "run_current": "/run",
-    }
-    
-    mapped_command = command_map.get(data)
-    if not mapped_command:
-        await query.message.reply_text(f"{Emoji.ERROR} Unknown command")
-        return
-    
-    # Process as text command
-    await process_text(
-        query.message,
-        context,
-        chat_id,
-        mapped_command
+    await update.message.reply_text(
+        status_text, 
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=get_status_keyboard()
     )
 
-async def on_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle all graph commands."""
+async def on_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /diagnostics command."""
     if not await check_authorization(update):
         return
     
-    await on_text(update, context)
+    # Send loading message
+    loading = await update.message.reply_text(f"{Emoji.LOADING} Запуск диагностики...")
+    
+    try:
+        diagnostics_result = await run_diagnostics()
+        await loading.delete()
+        await send_long_message(
+            update,
+            diagnostics_result,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        await loading.delete()
+        await update.message.reply_text(
+            f"{Emoji.ERROR} Ошибка диагностики: {str(e)[:200]}"
+        )
 
-async def on_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    override_text: Optional[str] = None
-) -> None:
-    """Handle text messages and commands."""
+async def on_graph_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle graph-dependent commands."""
     if not await check_authorization(update):
         return
     
-    if not update.message:
+    if not GRAPH_AVAILABLE:
+        await update.message.reply_text(
+            f"{Emoji.ERROR} **Graph Engine недоступен**\n\n"
+            f"Причина: {GRAPH_ERROR}\n\n"
+            "Что делать:\n"
+            "1. Проверьте `/diagnostics`\n"
+            "2. Убедитесь что graph_app.py существует\n"
+            "3. Проверьте API ключи в .env\n"
+            "4. Перезапустите бота",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_status_keyboard()
+        )
         return
     
+    # Если Graph доступен, обрабатываем команду
+    await process_graph_command(update, context)
+
+async def process_graph_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process command through graph engine."""
     chat_id = update.effective_chat.id
-    payload = override_text or (update.message.text or "").strip()
+    payload = (update.message.text or "").strip()
     
-    await process_text(update.message, context, chat_id, payload)
-
-async def process_text(
-    message: Any,
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    payload: str
-) -> None:
-    """Process text through graph engine with enhanced error handling."""
     if not payload:
-        await message.reply_text(
+        await update.message.reply_text(
             f"{Emoji.WARNING} Empty message. Send a command or task description."
         )
         return
     
     # Show typing indicator
-    typing_task = None
-    try:
-        typing_task = asyncio.create_task(
-            context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        )
-    except Exception as e:
-        logger.warning(f"Failed to send typing indicator: {e}")
+    typing_task = asyncio.create_task(
+        context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    )
     
-    # Send loading message
-    loading = None
-    try:
-        loading = await message.reply_text(f"{Emoji.LOADING} Processing request...")
-    except Exception as e:
-        logger.error(f"Failed to send loading message: {e}")
+    loading = await update.message.reply_text(f"{Emoji.LOADING} Processing request...")
     
     try:
-        # Invoke graph
         start_time = time.time()
         result = await invoke_graph_with_retry(chat_id, payload)
         elapsed = time.time() - start_time
         
         logger.info(f"Graph processed in {elapsed:.2f}s for chat {chat_id}")
         
-    except asyncio.TimeoutError:
-        logger.warning(f"Graph timeout for chat {chat_id}")
-        if loading:
-            with contextlib.suppress(Exception):
-                await loading.delete()
+        reply = result.get("reply_text", "Completed.")
+        await send_long_message(update, reply)
         
-        await message.reply_text(
-            f"{Emoji.WARNING} Request timed out after {config.graph_timeout}s\n"
-            "The operation may be too complex. Try simplifying your request."
-        )
-        return
+        # Send file if available
+        file_to_send = result.get("file_to_send")
+        if file_to_send and Path(file_to_send).exists():
+            try:
+                with open(file_to_send, 'rb') as f:
+                    await context.bot.send_document(
+                        chat_id,
+                        document=f,
+                        filename=Path(file_to_send).name,
+                        caption=f"📦 Archive: {Path(file_to_send).name}"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to send file: {e}")
         
     except Exception as e:
-        logger.exception(f"Graph invoke error for chat {chat_id}")
-        if loading:
-            with contextlib.suppress(Exception):
-                await loading.delete()
+        logger.exception(f"Graph command error for chat {chat_id}")
         
         error_msg = str(e)
-        if "api" in error_msg.lower():
-            error_detail = "API connection issue"
+        if "graph недоступен" in error_msg.lower():
+            error_detail = "Graph engine недоступен"
         elif "timeout" in error_msg.lower():
             error_detail = "Request timeout"
-        elif "rate" in error_msg.lower():
-            error_detail = "Rate limit exceeded"
-        elif "key" in error_msg.lower():
-            error_detail = "API key issue"
+        elif "api" in error_msg.lower():
+            error_detail = "API connection issue"
         else:
             error_detail = "Processing failed"
         
-        await message.reply_text(
+        await update.message.reply_text(
             f"{Emoji.ERROR} {error_detail}\n"
             f"Details: {error_msg[:200]}"
         )
-        return
     
     finally:
-        # Cancel typing task
-        if typing_task:
-            typing_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await typing_task
-    
-    # Delete loading message
-    if loading:
+        typing_task.cancel()
         with contextlib.suppress(Exception):
             await loading.delete()
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline button callbacks."""
+    query = update.callback_query
+    if not query or not await check_authorization(update):
+        if query:
+            await query.answer("Unauthorized", show_alert=True)
+        return
     
-    # Extract response
-    reply = result.get("reply_text", "Completed.")
-    file_to_send = result.get("file_to_send")
+    await query.answer()
+    data = query.data or ""
     
-    # Check if LLM choice is needed
-    if detect_llm_choice_needed(reply):
-        await send_long_message(update, reply)
-        await message.reply_text(
-            "Select model for code generation or run with current:",
-            reply_markup=get_llm_keyboard()
-        )
-    else:
-        await send_long_message(update, reply)
+    if data == "retry_graph":
+        global GRAPH_AVAILABLE, GRAPH_ERROR
+        GRAPH_AVAILABLE = safe_import_graph()
+        status = "✅ Успешно!" if GRAPH_AVAILABLE else f"❌ {GRAPH_ERROR}"
+        await query.message.reply_text(f"🔄 Повторная попытка: {status}")
     
-    # Send file if available
-    if file_to_send:
-        await send_file_if_exists(context, chat_id, file_to_send)
+    elif data == "run_diagnostics":
+        await on_diagnostics(update, context)
+    
+    elif data == "cmd_help":
+        await on_help(update, context)
+    
+    elif data.startswith("choose_") or data == "run_current":
+        if not GRAPH_AVAILABLE:
+            await query.message.reply_text(
+                f"{Emoji.ERROR} Graph недоступен для выбора модели"
+            )
+        else:
+            command_map = {
+                "choose_gpt5": "/llm gpt-5",
+                "choose_claude": "/llm claude-opus-4-1-20250805",
+                "run_current": "/run",
+            }
+            mapped_command = command_map.get(data)
+            if mapped_command:
+                # Создаем фейковое сообщение с командой
+                update.message.text = mapped_command
+                await process_graph_command(update, context)
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle unhandled errors."""
@@ -633,83 +655,37 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error(f"Failed to send error message: {e}")
 
 # =========================
-# Health Check & Monitoring
-# =========================
-async def health_check() -> bool:
-    """Perform basic health check of the bot systems."""
-    try:
-        # Test graph import
-        if not APP:
-            return False
-        
-        # Could add more checks here (database, APIs, etc.)
-        return True
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return False
-
-async def periodic_cleanup():
-    """Periodic cleanup task."""
-    while True:
-        try:
-            await asyncio.sleep(3600)  # Run every hour
-            logger.info("Running periodic cleanup...")
-            
-            # Here you could add cleanup logic:
-            # - Clear old checkpoints
-            # - Clean temporary files
-            # - Log statistics
-            
-        except asyncio.CancelledError:
-            logger.info("Cleanup task cancelled")
-            break
-        except Exception as e:
-            logger.error(f"Cleanup task error: {e}")
-
-# =========================
 # Bot Setup
 # =========================
 async def post_init(application: Application) -> None:
     """Post-initialization setup."""
-    # Set bot commands
     commands = [
         BotCommand("start", "Initialize bot"),
         BotCommand("help", "Show help"),
-        BotCommand("create", "Create/activate file"),
-        BotCommand("switch", "Switch to file"),
-        BotCommand("files", "List files"),
-        BotCommand("model", "View models"),
-        BotCommand("llm", "Select LLM"),
-        BotCommand("run", "Run generation"),
-        BotCommand("reset", "Reset state"),
-        BotCommand("download", "Download files"),
-        BotCommand("status", "Bot status"),
+        BotCommand("status", "Show system status"),
+        BotCommand("diagnostics", "Run diagnostics"),
     ]
     
+    if GRAPH_AVAILABLE:
+        commands.extend([
+            BotCommand("create", "Create/activate file"),
+            BotCommand("switch", "Switch to file"),
+            BotCommand("files", "List files"),
+            BotCommand("model", "View models"),
+            BotCommand("llm", "Select LLM"),
+            BotCommand("run", "Run generation"),
+            BotCommand("reset", "Reset state"),
+            BotCommand("download", "Download files"),
+        ])
+    
     await application.bot.set_my_commands(commands)
-    logger.info("Bot commands registered")
-    
-    # Start cleanup task
-    application.create_task(periodic_cleanup())
-    logger.info("Periodic cleanup task started")
+    logger.info(f"Bot commands registered ({len(commands)} commands)")
 
-async def shutdown(application: Application) -> None:
-    """Cleanup on shutdown."""
-    logger.info("Bot shutting down...")
-    
-    # Cancel all tasks
-    for task in asyncio.all_tasks():
-        if not task.done():
-            task.cancel()
-
-# =========================
-# Main Application
-# =========================
 def build_application() -> Application:
     """Build the Telegram bot application."""
     builder = ApplicationBuilder().token(config.token)
     
-    # Configure connection pool with more robust settings
+    # Configure connection pool
     builder.connection_pool_size(8)
     builder.connect_timeout(30.0)
     builder.read_timeout(30.0)
@@ -718,45 +694,41 @@ def build_application() -> Application:
     
     app = builder.build()
     
-    # Add handlers
+    # Add basic handlers
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("help", on_help))
     app.add_handler(CommandHandler("status", on_status))
+    app.add_handler(CommandHandler("diagnostics", on_diagnostics))
     
-    # Graph commands
-    for cmd in ["create", "switch", "files", "model", "llm", "run", "reset", "download"]:
-        app.add_handler(CommandHandler(cmd, on_command))
+    # Add graph-dependent handlers
+    if GRAPH_AVAILABLE:
+        for cmd in ["create", "switch", "files", "model", "llm", "run", "reset", "download"]:
+            app.add_handler(CommandHandler(cmd, on_graph_command))
+        
+        # Plain text for graph
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_graph_command))
+    else:
+        # Fallback handlers for graph commands
+        for cmd in ["create", "switch", "files", "model", "llm", "run", "reset", "download"]:
+            app.add_handler(CommandHandler(cmd, on_graph_command))
     
     # Callbacks
     app.add_handler(CallbackQueryHandler(on_callback))
-    
-    # Plain text
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     
     # Error handler
     app.add_error_handler(on_error)
     
     # Lifecycle hooks
     app.post_init = post_init
-    app.post_shutdown = shutdown
     
     return app
 
 async def main() -> None:
     """Main entry point."""
-    logger.info(f"Starting bot with module: {config.app_module}.{config.app_name}")
-    logger.info(f"Checkpoint namespace: {config.checkpoint_ns}")
-    logger.info(f"Graph timeout: {config.graph_timeout}s")
+    logger.info(f"Starting bot (Graph: {'✅' if GRAPH_AVAILABLE else '❌'})")
     
-    # Health check before starting
-    if not await health_check():
-        logger.critical("Health check failed, aborting startup")
-        sys.exit(1)
-    
-    # Build application
     app = build_application()
     
-    # Initialize
     await app.initialize()
     await app.start()
     
@@ -767,10 +739,8 @@ async def main() -> None:
             drop_pending_updates=True
         )
         
-        # Keep running
         stop_event = asyncio.Event()
         
-        # Handle signals
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}")
             stop_event.set()
@@ -789,9 +759,6 @@ async def main() -> None:
         await app.shutdown()
         logger.info("Bot stopped gracefully")
 
-# =========================
-# Entry Point
-# =========================
 if __name__ == "__main__":
     try:
         asyncio.run(main())
