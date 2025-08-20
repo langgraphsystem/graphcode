@@ -177,8 +177,6 @@ async def check_authorization(update: Update) -> bool:
 # =========================
 # Helpers
 # =========================
-*** a/bot.py
---- b/bot.py
 @@
  async def invoke_graph_with_retry(
      chat_id: int, 
@@ -670,4 +668,5 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
         sys.exit(1)
+
 
