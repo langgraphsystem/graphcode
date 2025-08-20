@@ -1,4 +1,3 @@
-# graph_app.py
 from __future__ import annotations
 import os, re, time, hashlib, sqlite3, zipfile, json, logging
 from pathlib import Path
@@ -583,23 +582,13 @@ def node_create(state: GraphState) -> GraphState:
     """Создание нового файла с безопасным именем"""
     chat_id = state["chat_id"]
     raw_filename = (state.get("arg") or "main.py").strip()
-    
-    # Очищаем имя файла
     filename = sanitize_filename(raw_filename)
-    
-    # Определяем язык
     language = detect_language(filename)
-    
-    # Создаем файл-заглушку
     ensure_latest_placeholder(chat_id, filename, language)
-    
     state["active_file"] = filename
-    state["reply_text"] = f"✅ Файл создан/активирован: `{filename}`\n🔤 Язык: {language}"
-    
-    # Если имя было изменено, сообщаем
+    state["reply_text"] = f"✅ Файл создан/активирован: {filename}\n🔤 Язык: {language}"
     if filename != raw_filename:
         state["reply_text"] += f"\n⚠️ Имя файла было очищено от небезопасных символов"
-    
     audit_event(chat_id, "CREATE", active_file=filename, model=state.get("model"))
     return state
 
@@ -608,20 +597,15 @@ def node_switch(state: GraphState) -> GraphState:
     """Переключение на существующий файл"""
     chat_id = state["chat_id"]
     filename = (state.get("arg") or "").strip()
-    
     if not filename:
-        state["reply_text"] = "Укажи имя: `/switch app.py`"
+        state["reply_text"] = "Укажи имя: /switch app.py"
         return state
-    
-    # Очищаем имя файла
     filename = sanitize_filename(filename)
-    
     if not latest_path(chat_id, filename).exists():
-        state["reply_text"] = f"Файл `{filename}` ещё не создан. Используй `/create {filename}`."
+        state["reply_text"] = f"Файл {filename} ещё не создан. Используй /create {filename}."
         return state
-    
     state["active_file"] = filename
-    state["reply_text"] = f"🔀 Переключился на `{filename}`."
+    state["reply_text"] = f"🔀 Переключился на {filename}."
     audit_event(chat_id, "SWITCH", active_file=filename, model=state.get("model"))
     return state
 
@@ -630,7 +614,7 @@ def node_files(state: GraphState) -> GraphState:
     """Показать список файлов"""
     files = list_files(state["chat_id"])
     if not files:
-        state["reply_text"] = "Файлов пока нет. Начни с `/create app.py`."
+        state["reply_text"] = "Файлов пока нет. Начни с /create app.py."
     else:
         state["reply_text"] = "🗂 Файлы:\n" + "\n".join(f"- {f}" for f in files)
     audit_event(state["chat_id"], "FILES", active_file=state.get("active_file"), model=state.get("model"))
@@ -640,7 +624,7 @@ def node_files(state: GraphState) -> GraphState:
 def node_model(state: GraphState) -> GraphState:
     """Показать информацию о модели (только GPT-5)"""
     state["reply_text"] = (
-        f"🧠 Используется модель: `GPT-5`\n\n"
+        f"🧠 Используется модель: GPT-5\n\n"
         f"ℹ️ Это единственная поддерживаемая модель.\n"
         f"Все запросы автоматически направляются на GPT-5."
     )
@@ -652,7 +636,7 @@ def node_reset(state: GraphState) -> GraphState:
     """Сброс состояния чата"""
     state["active_file"] = None
     state["model"] = DEFAULT_MODEL
-    state["reply_text"] = "♻️ Сбросил состояние чата. Начни с `/create <filename>`."
+    state["reply_text"] = "♻️ Сбросил состояние чата. Начни с /create <filename>."
     audit_event(state["chat_id"], "RESET")
     return state
 
@@ -730,13 +714,13 @@ def node_generate(state: GraphState) -> GraphState:
             code = extract_code(codegen_text)
             updated_path = version_current_file(chat_id, active, code)
 
-        # Формируем ответ
+        # Формируем ответ БЕЗ обратных кавычек
         rel = latest_path(chat_id, active).relative_to(OUTPUT_DIR)
         state["reply_text"] = (
-            f"✅ Обновил `{active}` через PROMPT-ADAPTER v3\n"
-            f"🧠 Модель: `GPT-5`\n"
-            f"📁 Контракт: `{(mode or output_pref)}`\n"
-            f"💾 Сохранено: `{rel}`\n\n"
+            f"✅ Обновил {active} через PROMPT-ADAPTER v3\n"
+            f"🧠 Модель: GPT-5\n"
+            f"📁 Контракт: {(mode or output_pref)}\n"
+            f"💾 Сохранено: {rel}\n\n"
             f"Отправь следующий промпт или используй команды."
         )
         
@@ -770,35 +754,6 @@ def node_generate(state: GraphState) -> GraphState:
 
     return state
 
-# --------- DOWNLOAD ---------
-def _iter_selected_files(base: Path, arg: Optional[str]) -> Iterable[Path]:
-    """Итератор по выбранным файлам"""
-    files = [p for p in base.iterdir() if p.is_file()]
-    if not arg:
-        return sorted(files)
-    
-    arg = arg.strip().lower()
-    if arg == "latest":
-        return sorted([p for p in files if p.name.startswith("latest-")])
-    if arg == "versions":
-        return sorted([p for p in files if not p.name.startswith("latest-")])
-    
-    return sorted([p for p in files if p.name == f"latest-{arg}" or p.name.endswith(f"-{arg}")])
-
-def _make_zip(chat_id: int, arg: Optional[str]) -> Path:
-    """Создание ZIP архива с выбранными файлами"""
-    base = chat_dir(chat_id)
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    out = base / f"export-{ts}.zip"
-    to_pack = list(_iter_selected_files(base, arg))
-    
-    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for p in to_pack:
-            z.write(p, arcname=p.name)
-    
-    logger.info(f"Created ZIP archive: {out.name} with {len(to_pack)} files")
-    return out
-
 @safe_node
 def node_download(state: GraphState) -> GraphState:
     """Создание архива для скачивания"""
@@ -809,7 +764,7 @@ def node_download(state: GraphState) -> GraphState:
         z = _make_zip(chat_id, arg)
         state["file_to_send"] = str(z)
         sel = arg or "all"
-        state["reply_text"] = f"📦 Подготовил архив `{z.name}` ({sel})."
+        state["reply_text"] = f"📦 Подготовил архив {z.name} ({sel})."
         audit_event(chat_id, "DOWNLOAD", active_file=state.get("active_file"), model="gpt-5", output_path=z)
     except Exception as e:
         logger.error(f"Failed to create archive: {e}")
@@ -950,5 +905,3 @@ APP = build_app()
 __all__ = ['APP', 'DEFAULT_MODEL', 'VALID_MODELS']
 
 logger.info(f"Graph app initialized. Model: GPT-5 only. Output dir: {OUTPUT_DIR}")
-
-
