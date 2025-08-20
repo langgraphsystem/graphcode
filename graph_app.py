@@ -127,13 +127,11 @@ def _is_placeholder_or_empty(content: str) -> bool:
 
 # ---------- PROMPT-ADAPTER V3 шаблон ----------
 PROMPT_ADAPTER_V3 = r"""[PROMPT-ADAPTER v3 — EN-adapt, API-ready]
-
 [STATIC RULES — cacheable]
 You are a PromptAdapter for code generation via OpenAI API (GPT-5). Your job: take RAW_TASK (any language) + CONTEXT and return an API-ready package with:
 - clean English developer instructions,
 - user message containing both original content and an English adaptation of the *instructions/specs only*,
 - a strict response contract (FILES_JSON | UNIFIED_DIFF | TOOLS_CALLS).
-
 Principles:
 1) Role separation: put rules in developer; data/context in user. 
 2) Output must follow the selected mode exactly (no extra prose).
@@ -142,12 +140,10 @@ Principles:
 5) If inputs are incomplete, state careful assumptions explicitly.
 6) For multi-file changes use TOOLS_CALLS with atomic tool calls.
 7) Limit “verbal text” to ≤200 lines outside code/DIFF (code/DIFF not limited, but keep within model output limits).
-
 **English Adaptation Policy (very important):**
 - Translate *instructions/specs/requirements* to English concisely.
 - DO NOT translate or alter: code blocks, stack traces, file paths, API names, JSON/YAML/TOML, unified diffs, quoted UI strings, or domain terms when translation could change semantics.
 - If OUTPUT_LANG is specified (e.g., RU for UI text), keep user-facing strings in that language; keep identifiers/comments as requested.
-
 [OUTPUT SCHEMA — return ONE JSON object]
 {
   "messages": [
@@ -186,7 +182,6 @@ Principles:
   "risks":["edge cases & risks"],
   "notes":"short CI/CD hints"
 }
-
 [HOW TO FILL]
 1) messages.developer (EN): set strict code rules—language/version, style, formatter/linter, security/perf constraints, error/log policy, and the exact output format per response_contract.mode. 
 2) messages.user: pack inputs with clear delimiters, include bilingual content:
@@ -214,13 +209,11 @@ Principles:
    - TOOLS_CALLS — for multi-file edits; the model must call tools.
 4) runbook: 3–6 steps for build/run/test, brief.
 5) assumptions/risks: explicit and minimal.
-
 [STYLE]
 - Developer message: English.
 - User message: includes RAW + EN_ADAPT.
 - Keep non-code prose concise (≤200 lines).
 - No internal reasoning; only final results and a short plan.
-
 [DYNAMIC INPUT — fill at call-time]
 RAW_TASK: <<<RAW_TASK>>>
 {RAW_TASK}
@@ -234,7 +227,6 @@ CONSTRAINTS: {CONSTRAINTS}
 TEST_POLICY: {TEST_POLICY}
 OUTPUT_PREF: {OUTPUT_PREF}
 OUTPUT_LANG: {OUTPUT_LANG}
-
 [NOW DO]
 Construct and return ONE JSON object strictly matching OUTPUT SCHEMA, with developer in English and user containing both RAW and EN_ADAPT, following the English Adaptation Policy.
 """
@@ -424,7 +416,7 @@ def node_model(state: GraphState) -> GraphState:
         return state
     state["model"] = arg
     state["reply_text"] = f"🧠 Модель установлена: `{arg}`"
-    audit_event(state["chat_id"], "MODEL", active_file=state.get("active_file"), model=arg)
+    audit_event(chat_id=state["chat_id"], event_type="MODEL", active_file=state.get("active_file"), model=arg)
     return state
 
 def node_reset(state: GraphState) -> GraphState:
@@ -438,11 +430,6 @@ def _infer_output_pref(raw_text: str, has_context: bool) -> str:
     if has_context and (DIFF_BLOCK_RE.search(raw_text) or UNIFIED_DIFF_HINT_RE.search(raw_text) or GIT_DIFF_HINT_RE.search(raw_text)):
         return "UNIFIED_DIFF"
     return ADAPTER_OUTPUT_PREF
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(1, 1, 8), retry=retry_if_exception_type(Exception), reraise=True)
-def _openai_create_simple(model: str, prompt: str) -> str:
-    resp = client.with_options(timeout=REQUEST_TIMEOUT).responses.create(model=model, input=prompt, max_output_tokens=4096, temperature=0.2)
-    return getattr(resp, "output_text", None) or extract_code(str(resp))
 
 def node_generate(state: GraphState) -> GraphState:
     chat_id = state["chat_id"]
@@ -572,9 +559,12 @@ def build_app():
         sg.add_edge(node, END)
 
     if _CHECKPOINTER_KIND == "sqlite":
-        checkpointer = SqliteSaver.from_file(OUTPUT_DIR / "langgraph.db")
+        # ВАЖНО: актуальный API — from_conn_string(), не from_file()
+        db_path = OUTPUT_DIR / "langgraph.db"
+        checkpointer = SqliteSaver.from_conn_string(str(db_path))
     else:
         checkpointer = MemorySaver()
+
     return sg.compile(checkpointer=checkpointer)
 
 APP = build_app()
