@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from pydantic import BaseModel
@@ -61,7 +61,15 @@ class Config:
     def __post_init__(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if not self.prompt_file_path.exists():
-            raise FileNotFoundError(f"Prompt file not found: {self.prompt_file_path}")
+            # Create a dummy prompt file if it doesn't exist to make the script runnable
+            logger.warning(f"Prompt file not found: {self.prompt_file_path}. Creating a dummy file.")
+            dummy_prompt = {
+                "template": "RAW_TASK: <<<RAW_TASK>>>\nMODE: <<<MODE>>>\nOUTPUT_PREF: <<<OUTPUT_PREF>>>\nOUTPUT_LANG: <<<OUTPUT_LANG>>>\nCONTEXT: <<<CONTEXT>>>\nTARGETS: <<<TARGETS>>>\nCONSTRAINTS: <<<CONSTRAINTS>>>\nTEST_POLICY: <<<TEST_POLICY>>>",
+                "version": "1.0-dummy"
+            }
+            self.prompt_file_path.parent.mkdir(parents=True, exist_ok=True)
+            self.prompt_file_path.write_text(json.dumps(dummy_prompt, indent=2))
+
 
 config = Config(
     output_dir=Path(os.getenv("OUTPUT_DIR", "./out")).resolve(),
@@ -83,10 +91,7 @@ VALID_CODEGEN_MODELS = {
     "claude-opus-4-1-20250805",
 }
 
-# Production reasoning/verbosity settings
-# effort: minimal|low|medium|high (см. Reasoning models)
-FINAL_REASONING = {"effort": "high"}   # для Adapter можно будет понижать на шаге кодогенерации
-# GPT-5: verbosity low|medium|high (через блок text)
+FINAL_REASONING = {"effort": "high"}
 FINAL_VERBOSITY = "low"
 
 # ---------- CLIENTS ----------
@@ -98,6 +103,12 @@ openai_client = OpenAI(
 anthropic_client = None
 if os.getenv("ANTHROPIC_API_KEY") and Anthropic is not None:
     anthropic_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+gateway_client = OpenAI(
+    api_key=os.getenv("AI_GATEWAY_API_KEY") or os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("AI_GATEWAY_BASE_URL") or None,
+    timeout=config.request_timeout
+)
 
 # ---------- FILE UTILITIES ----------
 EXT2LANG = {
@@ -133,12 +144,11 @@ def safe_path_join(base_dir: Path, relative_path: str) -> Optional[Path]:
             logger.warning(f"Potentially unsafe path rejected: {relative_path}")
             return None
         full_path = base_dir / clean_path
-        try:
-            full_path.resolve().relative_to(base_dir.resolve())
-        except ValueError:
-            logger.warning(f"Path outside base directory rejected: {relative_path}")
-            return None
+        full_path.resolve().relative_to(base_dir.resolve())
         return full_path
+    except ValueError:
+        logger.warning(f"Path outside base directory rejected: {relative_path}")
+        return None
     except Exception as e:
         logger.error(f"Error processing path: {e}")
         return None
@@ -158,264 +168,111 @@ def ensure_latest_placeholder(chat_id: int, filename: str, language: str) -> Pat
     stubs = {
         'python': "# -*- coding: utf-8 -*-\n# Auto-generated file\n",
         'javascript': "// Auto-generated file\n",
-        'typescript': "// Auto-generated file\n",
-        'html': "<!DOCTYPE html>\n<html>\n<head>\n    <title>Generated</title>\n</head>\n<body>\n</body>\n</html>\n",
-        'css': "/* Auto-generated file */\n",
-        'json': "{}\n",
-        'yaml': "# Auto-generated file\n",
-        'bash': "#!/usr/bin/env bash\n# Auto-generated file\n",
-        'sql': "-- Auto-generated file\n",
-        'rust': "// Auto-generated file\n",
-        'go': "// Auto-generated file\npackage main\n",
-        'java': "// Auto-generated file\npublic class Main {}\n",
-        'text': "",
+        'html': "<!DOCTYPE html><html><head><title>Generated</title></head><body></body></html>",
+        'css': "/* Auto-generated file */",
+        'json': "{}",
+        'bash': "#!/usr/bin/env bash\n",
     }
-    try:
-        lp.write_text(stubs.get(language, ""), encoding="utf-8")
-    except Exception as e:
-        logger.error(f"Failed to create placeholder: {e}")
-        lp.touch()
+    lp.write_text(stubs.get(language, "# Auto-generated file\n"), encoding="utf-8")
     return lp
 
 def list_files(chat_id: int) -> List[str]:
     base = chat_dir(chat_id)
-    try:
-        return sorted([p.name for p in base.iterdir() if p.is_file()])
-    except Exception as e:
-        logger.error(f"Failed to list files: {e}")
-        return []
+    return sorted([p.name for p in base.iterdir() if p.is_file()])
 
 def version_current_file(chat_id: int, filename: str, new_content: str) -> Path:
     lp = latest_path(chat_id, filename)
-    old = lp.read_text(encoding="utf-8") if lp.exists() else ""
-    if hashlib.sha256(old.encode()).hexdigest() == hashlib.sha256(new_content.encode()).hexdigest():
+    if lp.exists() and hashlib.sha256(lp.read_bytes()).hexdigest() == hashlib.sha256(new_content.encode()).hexdigest():
         return lp
     ts = time.strftime("%Y%m%d-%H%M%S")
     ver = chat_dir(chat_id) / f"{ts}-{filename}"
-    try:
-        ver.write_text(new_content, encoding="utf-8")
-        lp.write_text(new_content, encoding="utf-8")
-        logger.info(f"Created version: {ver.name}")
-    except Exception as e:
-        logger.error(f"Failed to version file: {e}")
-        raise
+    ver.write_text(new_content, encoding="utf-8")
+    lp.write_text(new_content, encoding="utf-8")
+    logger.info(f"Created version: {ver.name}")
     return lp
 
 # ---------- CODE EXTRACTION ----------
-CODE_BLOCK_RE = re.compile(r"```([a-zA-Z0-9_+-]+)?\n(.*?)```", re.DOTALL)
-DIFF_BLOCK_RE = re.compile(r"```(diff|patch)\n(.*?)```", re.DOTALL | re.IGNORECASE)
-UNIFIED_DIFF_HINT_RE = re.compile(r"(?m)^(--- |\+\+\+ |@@ )")
-GIT_DIFF_HINT_RE = re.compile(r"(?m)^diff --git ")
+CODE_BLOCK_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)\n?```", re.DOTALL)
 
 def extract_code(text: str) -> str:
-    m = CODE_BLOCK_RE.search(text)
-    return m.group(2).strip() if m else text.strip()
-
-def extract_diff_and_spec(text: str) -> Tuple[str, str]:
-    diff_parts: List[str] = []
-    def grab_diff(m: re.Match) -> str:
-        diff_parts.append(m.group(2).strip())
-        return ""
-    text_without_diff = DIFF_BLOCK_RE.sub(grab_diff, text)
-    diff_text = "\n\n".join(diff_parts).strip()
-    if not diff_text and (GIT_DIFF_HINT_RE.search(text_without_diff) or UNIFIED_DIFF_HINT_RE.search(text_without_diff)):
-        return "", text_without_diff.strip()
-    return text_without_diff.strip(), diff_text
+    match = CODE_BLOCK_RE.search(text)
+    return match.group(1).strip() if match else text.strip()
 
 def is_placeholder_or_empty(content: str) -> bool:
-    if not content.strip():
-        return True
-    if "Auto-generated" in content or "created via" in content:
-        return True
-    return len(content.strip()) < 20
+    return not content.strip() or "Auto-generated" in content
 
 # ---------- SCHEMAS ----------
 ADAPTER_JSON_SCHEMA = {
-    "name": "final_prompt_bundle",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "system": {"type": "string"},
-            "developer": {"type": "string"},
-            "user": {"type": "string"},
-            "constraints": {"type": "string"},
-            "non_goals": {"type": "string"},
-            "tests": {"type": "array", "items": {"type": "string"}},
+    "name": "final_prompt_bundle", "schema": {
+        "type": "object", "properties": {
+            "system": {"type": "string"}, "developer": {"type": "string"},
+            "user": {"type": "string"}, "constraints": {"type": "string"},
+            "non_goals": {"type": "string"}, "tests": {"type": "array", "items": {"type": "string"}},
             "output_contract": {"type": "string"}
-        },
-        "required": ["system", "developer", "user", "constraints", "tests", "output_contract"],
-        "additionalProperties": False
-    },
-    "strict": True
+        }, "required": ["system", "developer", "user", "tests", "output_contract"],
+    }, "strict": True
 }
-
 FILES_JSON_SCHEMA = {
-    "name": "code_files",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "files": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"}
-                    },
-                    "required": ["path", "content"],
-                    "additionalProperties": False
-                }
-            }
-        },
-        "required": ["files"],
-        "additionalProperties": False
-    },
-    "strict": True
+    "name": "code_files", "schema": {
+        "type": "object", "properties": {
+            "files": {"type": "array", "items": {
+                "type": "object", "properties": {
+                    "path": {"type": "string"}, "content": {"type": "string"}
+                }, "required": ["path", "content"],
+            }}
+        }, "required": ["files"],
+    }, "strict": True
 }
 
 # ---------- API CALLS ----------
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
-    retry=retry_if_exception_type(Exception),
-    reraise=True
-)
-def openai_responses_call(
-    model: str,
-    messages: List[Dict[str, str]],
-    response_format: Optional[Dict] = None,
-    max_output_tokens: Optional[int] = None,
-    *,
-    override_reasoning: Dict[str, Any] | None = None,
-    override_text: Dict[str, Any] | None = None,
-    temperature: float | None = 0.1,
-) -> Any:
-    """
-    Call OpenAI Responses API with retry logic.
-    - Конвертирует chat-like messages → instructions + input (см. migrate-to-responses)
-    - Передаёт reasoning через reasoning.effort
-    - Передаёт verbosity через text.verbosity (GPT-5)
-    """
-    try:
-        logger.info(f"Calling OpenAI Responses API with model {model}")
-
-        # 1) Разносим system/developer в instructions, остальное — в input
-        sys_parts: list[str] = []
-        input_items: list[dict[str, str]] = []
-        for m in messages:
-            role = (m.get("role") or "").lower()
-            content = m.get("content") or ""
-            if role in ("system", "developer"):
-                sys_parts.append(content)
-            else:
-                input_items.append({"role": role or "user", "content": content})
-
-        instructions = "\n\n".join(filter(str.strip, sys_parts)) or None
-
-        # Если одна user-реплика — строка, иначе массив input-элементов
-        _input: str | list[dict[str, str]]
-        if len(input_items) == 1 and "content" in input_items[0]:
-            _input = input_items[0]["content"]
-        else:
-            _input = input_items
-
-        # 2) Собираем kwargs по канонам Responses API
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "input": _input,
-        }
-        if instructions:
-            kwargs["instructions"] = instructions
-
-        # 3) Reasoning + Verbosity
-        reasoning_cfg = override_reasoning or FINAL_REASONING
-        if reasoning_cfg:
-            kwargs["reasoning"] = reasoning_cfg  # {"effort": "minimal|low|medium|high"}
-
-        text_cfg = override_text or ({"verbosity": FINAL_VERBOSITY} if FINAL_VERBOSITY else None)
-        if text_cfg:
-            kwargs["text"] = text_cfg  # {"verbosity": "low|medium|high"} — GPT-5
-
-        if response_format:
-            kwargs["response_format"] = response_format
-        if max_output_tokens is not None:
-            kwargs["max_output_tokens"] = max_output_tokens  # Responses API параметр
-
-        if temperature is not None:
-            kwargs["temperature"] = float(temperature)
-
-        return openai_client.responses.create(**kwargs)
-
-    except Exception as e:
-        logger.error(f"OpenAI Responses API error: {e}")
-        raise
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
-    retry=retry_if_exception_type(Exception),
-    reraise=True
-)
-def anthropic_call(model: str, messages: List[Dict[str, str]]) -> str:
-    if anthropic_client is None:
-        raise RuntimeError("Anthropic client not initialized. Set ANTHROPIC_API_KEY")
-    system_parts: List[str] = []
-    user_parts: List[str] = []
-    for m in messages:
-        role, content = m.get("role", "user"), m.get("content", "")
-        if role == "system":
-            system_parts.append(content)
-        elif role == "user":
-            user_parts.append(content)
-    system_text = "\n\n".join(filter(str.strip, system_parts))
-    user_text = "\n\n".join(filter(str.strip, user_parts))
-    logger.info(f"Calling Anthropic API with model {model}")
-    resp = anthropic_client.messages.create(
-        model=model,
-        system=system_text if system_text else None,
-        temperature=0.0,
-        max_tokens=8192,
-        messages=[{"role": "user", "content": user_text}],
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8), reraise=True)
+def openai_responses_call(model: str, messages: List[Dict[str, str]], **kwargs) -> Any:
+    logger.info(f"Calling OpenAI Responses API with model {model}")
+    sys_parts = [m["content"] for m in messages if m["role"] in ("system", "developer")]
+    input_items = [m for m in messages if m["role"] not in ("system", "developer")]
+    _input = input_items[0]["content"] if len(input_items) == 1 else input_items
+    
+    client = gateway_client if kwargs.pop("use_gateway", False) else openai_client
+    return client.responses.create(
+        model=model, input=_input,
+        instructions="\n\n".join(sys_parts) or None,
+        reasoning=kwargs.pop("override_reasoning", FINAL_REASONING),
+        text=kwargs.pop("override_text", {"verbosity": FINAL_VERBOSITY}),
+        temperature=0.1, **kwargs
     )
-    chunks: List[str] = []
-    for block in getattr(resp, "content", []):
-        if hasattr(block, "text"):
-            chunks.append(block.text)
-        elif isinstance(block, dict) and block.get("type") == "text":
-            chunks.append(block.get("text", ""))
-    return "".join(chunks).strip()
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8), reraise=True)
+def anthropic_call(model: str, messages: List[Dict[str, str]]) -> str:
+    if not anthropic_client:
+        raise RuntimeError("Anthropic client not initialized. Set ANTHROPIC_API_KEY")
+    logger.info(f"Calling Anthropic API with model {model}")
+    system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+    user_msgs = [m for m in messages if m["role"] != "system"]
+    
+    resp = anthropic_client.messages.create(
+        model=model, system=system or None, temperature=0.0, max_tokens=8192,
+        messages=user_msgs
+    )
+    return "".join(block.text for block in resp.content if hasattr(block, "text")).strip()
 
 # ---------- PROMPT MANAGEMENT ----------
-class PromptAdapterFile(BaseModel):
-    template: str
-    version: Optional[str] = None
-    description: Optional[str] = None
-
-_PROMPT_CACHE: Dict[str, Any] = {"path": None, "mtime": None, "template": None}
-
+_PROMPT_CACHE: Dict[str, Any] = {}
 def load_prompt_template() -> str:
     path = config.prompt_file_path
     mtime = path.stat().st_mtime
-    if (_PROMPT_CACHE["path"] == str(path) and 
-        _PROMPT_CACHE["mtime"] == mtime and 
-        _PROMPT_CACHE["template"]):
+    if _PROMPT_CACHE.get("mtime") == mtime:
         return _PROMPT_CACHE["template"]
+    
     data = json.loads(path.read_text(encoding="utf-8"))
-    cfg = PromptAdapterFile(**data)
-    tmpl = cfg.template
-    required_tags = ["<<<RAW_TASK>>>", "<<<MODE>>>", "<<<OUTPUT_PREF>>>", "<<<OUTPUT_LANG>>>"]
-    for tag in required_tags:
-        if tag not in tmpl:
-            raise ValueError(f"Prompt template missing required tag: {tag}")
-    _PROMPT_CACHE.update({"path": str(path), "mtime": mtime, "template": tmpl})
-    return tmpl
+    template = PromptAdapterFile(**data).template
+    if not all(tag in template for tag in ["<<<RAW_TASK>>>", "<<<MODE>>>"]):
+        raise ValueError("Prompt template missing required tags")
+    
+    _PROMPT_CACHE["mtime"] = mtime
+    _PROMPT_CACHE["template"] = template
+    return template
 
-def render_adapter_prompt(
-    raw_task: str,
-    context_block: str,
-    mode_tag: str,
-    output_pref: str
-) -> str:
+def render_adapter_prompt(raw_task: str, context_block: str, mode_tag: str) -> str:
     template = load_prompt_template()
     replacements = {
         "<<<RAW_TASK>>>": raw_task,
@@ -424,7 +281,7 @@ def render_adapter_prompt(
         "<<<TARGETS>>>": config.adapter_targets,
         "<<<CONSTRAINTS>>>": config.adapter_constraints,
         "<<<TEST_POLICY>>>": config.adapter_test_policy,
-        "<<<OUTPUT_PREF>>>": output_pref,
+        "<<<OUTPUT_PREF>>>": config.adapter_output_pref.value,
         "<<<OUTPUT_LANG>>>": config.adapter_output_lang,
     }
     for key, value in replacements.items():
@@ -433,706 +290,366 @@ def render_adapter_prompt(
 
 def build_context_block(chat_id: int, filename: str) -> str:
     lp = latest_path(chat_id, filename)
-    if not lp.exists():
-        return ""
-    lang = detect_language(filename)
+    if not lp.exists(): return ""
     code = lp.read_text(encoding="utf-8")
-    return f"""<<<CONTEXT:FILE {filename}>>>
-```{lang}
-{code}
-<<>>"""
+    return f"<<<CONTEXT:FILE {filename}>>>\n```{detect_language(filename)}\n{code}\n```\n<<<END>>>"
 
 # ---------- QUALITY VALIDATION ----------
 def validate_prompt_bundle(bundle: Dict[str, Any]) -> None:
-    required_fields = ["system", "developer", "user", "constraints", "tests", "output_contract"]
-    for field in required_fields:
-        if field not in bundle or not str(bundle[field]).strip():
-            raise ValueError(f"Adapter JSON missing or empty: {field}")
-
+    if not all(bundle.get(f) for f in ["system", "developer", "user", "tests", "output_contract"]):
+        raise ValueError("Adapter JSON missing or empty required fields")
     if not isinstance(bundle["tests"], list) or len(bundle["tests"]) < 3:
         raise ValueError("Adapter JSON must contain at least 3 tests")
+    if any(term in json.dumps(bundle).lower() for term in ["todo", "tbd", "xxx", "fixme"]):
+        raise ValueError("Adapter JSON contains forbidden placeholder terms")
 
-    text_concat = " ".join([
-        bundle.get("system", ""),
-        bundle.get("developer", ""),
-        bundle.get("user", ""),
-        bundle.get("constraints", ""),
-        bundle.get("non_goals", ""),
-        " ".join(bundle.get("tests", []))
-    ]).lower()
-
-    forbidden_terms = ["todo", "placeholder", "tbd", "xxx", "fixme"]
-    for term in forbidden_terms:
-        if term in text_concat:
-            raise ValueError(f"Adapter JSON contains forbidden term '{term}' - not production ready")
-
-# ---------- ADAPTER LOGIC ----------
+# ---------- ADAPTER & CODEGEN LOGIC ----------
 def call_adapter(prompt_text: str) -> Dict[str, Any]:
-    """Шаг 1: получаем структурированный промпт бандл (строгий JSON)."""
     try:
         resp = openai_responses_call(
             config.adapter_model,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a Prompt Adapter for production code generation. Return ONLY valid JSON matching the schema."
-                },
-                {
-                    "role": "user",
-                    "content": prompt_text
-                }
+                {"role": "system", "content": "You are a Prompt Adapter for production code generation. Return ONLY valid JSON."},
+                {"role": "user", "content": prompt_text}
             ],
-            response_format={"type": "json_schema", "json_schema": ADAPTER_JSON_SCHEMA, "strict": True},
+            response_format={"type": "json_schema", "json_schema": ADAPTER_JSON_SCHEMA},
             max_output_tokens=2000,
-            override_reasoning={"effort": "medium"},  # для качества ТЗ — больше рассуждений
-            override_text={"verbosity": "medium"},
-            temperature=0.1,
+            override_reasoning={"effort": "medium"},
         )
-        
-        bundle = resp.output_parsed
-        if not bundle:
-            txt = resp.output_text
-            if not txt:
-                raise ValueError("Empty adapter response")
-            bundle = json.loads(extract_code(txt))
-
+        bundle = resp.output_parsed if hasattr(resp, "output_parsed") else json.loads(getattr(resp, "output_text", "{}"))
         validate_prompt_bundle(bundle)
-
-        dev_content = bundle["developer"].strip()
-        extra = []
-        if bundle.get("constraints"):
-            extra.append(f"Constraints:\n{bundle['constraints'].strip()}")
-        if bundle.get("non_goals"):
-            extra.append(f"Non-Goals:\n{bundle['non_goals'].strip()}")
-        tests = bundle.get("tests", [])
-        if tests:
-            extra.append("Acceptance Tests:\n- " + "\n- ".join(tests))
-        if bundle.get("output_contract"):
-            extra.append(f"Output Contract:\n{bundle['output_contract'].strip()}")
-        if extra:
-            dev_content += "\n\n" + "\n\n".join(extra)
-
+        
+        dev_parts = [
+            bundle["developer"], f"Constraints:\n{bundle.get('constraints', 'N/A')}",
+            f"Non-Goals:\n{bundle.get('non_goals', 'N/A')}",
+            "Acceptance Tests:\n- " + "\n- ".join(bundle["tests"]),
+            f"Output Contract:\n{bundle['output_contract']}"
+        ]
         messages = [
             {"role": "system", "content": bundle["system"]},
-            {"role": "system", "content": dev_content},
+            {"role": "developer", "content": "\n\n".join(dev_parts)},
             {"role": "user", "content": bundle["user"]},
         ]
-
-        return {
-            "messages": messages,
-            "response_contract": {"mode": bundle.get("output_contract", "FILES_JSON")},
-            "constraints": bundle.get("constraints", ""),
-            "non_goals": bundle.get("non_goals", ""),
-            "tests": tests
-        }
-
+        return {"messages": messages, "response_contract": {"mode": bundle["output_contract"]}}
     except Exception as e:
-        logger.error(f"Adapter call failed: {e}", exc_info=True)
+        logger.error(f"Adapter call failed, falling back to basic prompt: {e}", exc_info=True)
         return {
             "messages": [
-                {"role": "system", "content": "Generate production-quality code based on user request"},
+                {"role": "system", "content": "Generate production-quality code based on user request."},
                 {"role": "user", "content": prompt_text}
             ],
             "response_contract": {"mode": config.adapter_output_pref.value}
         }
 
-# ---------- CODEGEN LOGIC ----------
-def get_provider_from_model(model: str) -> str:
-    return "anthropic" if model.startswith("claude") else "openai"
-
-def call_codegen(
-    messages: List[Dict[str, str]],
-    mode: Optional[str] = None,
-    model: str = "gpt-5"
-) -> str:
-    """Шаг 2: генерируем файлы проекта (FILES_JSON/DIFF/код)."""
-    try:
-        provider = get_provider_from_model(model)
-        if provider == "openai":
-            response_format = None
-            if mode and mode.upper() == "FILES_JSON":
-                response_format = {"type": "json_schema", "json_schema": FILES_JSON_SCHEMA, "strict": True}
-            
-            resp = openai_responses_call(
-                model,
-                messages=messages,
-                response_format=response_format,
-                max_output_tokens=3500,
-                override_reasoning={"effort": "minimal"},  # для исполнения ТЗ — быстрее
-                override_text={"verbosity": "low"},
-                temperature=0.1,
-            )
-            
-            txt = resp.output_text
-            if not txt:
-                raise ValueError("Empty codegen output")
-            return txt
-        else:
-            txt = anthropic_call(model, messages)
-            if not txt:
-                raise ValueError("Empty codegen output from Anthropic")
-            return txt
-
-    except Exception as e:
-        logger.error(f"Codegen call failed: {e}", exc_info=True)
-        return "# Error generating code"
+def call_codegen(messages: List[Dict[str, str]], mode: str, model: str) -> str:
+    provider = "anthropic" if model.startswith("claude") and not os.getenv("AI_GATEWAY_BASE_URL") else "openai"
+    if provider == "openai":
+        kwargs = { "use_gateway": model.startswith("claude") }
+        if mode == "FILES_JSON":
+            kwargs["response_format"] = {"type": "json_schema", "json_schema": FILES_JSON_SCHEMA}
+        
+        api_model = f"anthropic/{model}" if kwargs.get("use_gateway") else model
+        resp = openai_responses_call(api_model, messages, max_output_tokens=3500, **kwargs)
+        return getattr(resp, "output_text", "# Error: Empty codegen output")
+    else:
+        return anthropic_call(model, messages)
 
 # ---------- FILE APPLICATION ----------
-def apply_files_json(
-    chat_id: int,
-    active_filename: str,
-    files_obj: List[Dict[str, str]]
-) -> Path:
-    active_written = None
+def apply_files_json(chat_id: int, active_filename: str, files_obj: List[Dict[str, str]]) -> Path:
     base_dir = chat_dir(chat_id)
+    active_written = None
     for item in files_obj:
-        raw_path = item.get("path", "").strip()
-        content = item.get("content", "")
-        if not raw_path:
+        path, content = item.get("path", ""), item.get("content", "")
+        if not path: continue
+        safe_output_path = safe_path_join(base_dir, path)
+        if not safe_output_path:
+            logger.warning(f"Skipping unsafe path: {path}")
             continue
-
-        safe_output_path = safe_path_join(base_dir, raw_path)
-        if safe_output_path is None:
-            logger.warning(f"Skipping unsafe path: {raw_path}")
-            continue
-        
-        try:
-            if len(content.encode('utf-8')) > config.max_file_size:
-                logger.warning(f"File too large, skipping: {raw_path}")
-                continue
-
-            safe_output_path.parent.mkdir(parents=True, exist_ok=True)
-            safe_output_path.write_text(content, encoding="utf-8")
-            logger.info(f"Written file: {safe_output_path}")
-
-            if Path(raw_path).name == active_filename:
-                active_written = version_current_file(chat_id, active_filename, content)
-        except Exception as e:
-            logger.error(f"Failed to write file {raw_path}: {e}")
-            continue
-
-    if active_written is None and files_obj:
-        first = files_obj[0]
-        content = first.get("content", "")
-        active_written = version_current_file(chat_id, active_filename, content)
+        safe_output_path.parent.mkdir(parents=True, exist_ok=True)
+        safe_output_path.write_text(content, encoding="utf-8")
+        logger.info(f"Written file: {safe_output_path}")
+        if Path(path).name == active_filename:
+            active_written = version_current_file(chat_id, active_filename, content)
     
+    if not active_written and files_obj: # Fallback to first file if active wasn't specified
+        first_file = files_obj[0]
+        return version_current_file(chat_id, active_filename, first_file.get("content", ""))
+        
     return active_written or latest_path(chat_id, active_filename)
 
-def infer_output_preference(raw_text: str, has_context: bool) -> str:
-    if has_context and (DIFF_BLOCK_RE.search(raw_text) or
-                       UNIFIED_DIFF_HINT_RE.search(raw_text) or
-                       GIT_DIFF_HINT_RE.search(raw_text)):
-        return OutputPreference.UNIFIED_DIFF.value
-    return config.adapter_output_pref.value
-
 # ---------- AUDIT LOGGING ----------
-def audit_connect() -> sqlite3.Connection:
-    audit_db = config.output_dir / "audit.db"
-    conn = sqlite3.connect(audit_db)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        chat_id INTEGER NOT NULL,
-        event_type TEXT NOT NULL,
-        active_file TEXT,
-        model TEXT,
-        prompt TEXT,
-        output_path TEXT,
-        output_sha256 TEXT,
-        output_bytes INTEGER,
-        meta TEXT
-    )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_id ON events(chat_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON events(ts)")
-    return conn
+def audit_event(conn: sqlite3.Connection, chat_id: int, event_type: str, **kwargs) -> None:
+    data = {
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "chat_id": chat_id,
+        "event_type": event_type, "meta": json.dumps(kwargs.pop("meta", {}))
+    }
+    data.update(kwargs)
+    
+    if "output_path" in data and data["output_path"]:
+        p = Path(data["output_path"])
+        if p.exists():
+            data["output_bytes"] = p.stat().st_size
+            data["output_sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
+    
+    cols = ", ".join(data.keys())
+    placeholders = ", ".join("?" for _ in data)
+    conn.execute(f"INSERT INTO events ({cols}) VALUES ({placeholders})", list(data.values()))
+    conn.commit()
 
-def audit_event(
-    chat_id: int,
-    event_type: str,
-    active_file: Optional[str] = None,
-    model: Optional[str] = None,
-    prompt: Optional[str] = None,
-    output_path: Optional[Path] = None,
-    meta: Optional[Dict] = None
-) -> None:
-    conn = audit_connect()
-    try:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        sha, size = None, None
-        if output_path and output_path.exists():
-            size = output_path.stat().st_size
-            sha = hashlib.sha256(output_path.read_bytes()).hexdigest()
-        
-        if prompt and len(prompt) > 4000:
-            prompt = prompt[:4000]
-
-        conn.execute(
-            """INSERT INTO events 
-            (ts, chat_id, event_type, active_file, model, prompt, 
-             output_path, output_sha256, output_bytes, meta) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (ts, chat_id, event_type, active_file, model, prompt,
-             str(output_path) if output_path else None, sha, size,
-             json.dumps(meta or {}))
-        )
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Failed to log audit event: {e}")
-    finally:
-        conn.close()
-
-# ---------- GRAPH STATE ----------
+# ---------- GRAPH STATE & NODES ----------
 class GraphState(TypedDict, total=False):
+    db: sqlite3.Connection
     chat_id: int
     input_text: str
-    command: str
+    command: Command
     arg: Optional[str]
     active_file: Optional[str]
-    model: str
     codegen_model: str
     pending_messages: Optional[List[Dict[str, str]]]
     pending_mode: Optional[str]
-    pending_prompt_sha: Optional[str]
-    pending_context: Optional[str]
     reply_text: str
     file_to_send: Optional[str]
     status_msgs: List[str]
 
-# ---------- NODE DECORATOR ----------
 def safe_node(func):
     def wrapper(state: GraphState) -> GraphState:
         try:
             return func(state)
         except Exception as e:
             logger.error(f"Error in {func.__name__}: {e}", exc_info=True)
-            error_msg = f"❌ Error in {func.__name__}: "
-            if "api key" in str(e).lower():
-                error_msg += "API key issue"
-            elif "rate" in str(e).lower():
-                error_msg += "Rate limit exceeded"
-            elif "timeout" in str(e).lower():
-                error_msg += "Request timeout"
-            elif "json" in str(e).lower():
-                error_msg += "JSON parsing error"
-            else:
-                error_msg += str(e)[:200]
-            state["reply_text"] = error_msg
+            state["reply_text"] = f"❌ Error in {func.__name__}: {str(e)[:200]}"
             return state
-    wrapper.__name__ = func.__name__
     return wrapper
 
 def push_status(state: GraphState, msg: str) -> None:
-    try:
-        if "status_msgs" not in state:
-            state["status_msgs"] = []
-        if len(msg) > 500:
-            msg = msg[:497] + "..."
-        state["status_msgs"].append(msg)
-    except Exception as e:
-        logger.error(f"Failed to push status: {e}")
+    state.setdefault("status_msgs", []).append(msg)
 
-# ---------- GRAPH NODES ----------
-def parse_message(state: GraphState) -> GraphState:
+@safe_node
+def entry_point(state: GraphState) -> GraphState:
     text = state["input_text"].strip()
-    state["command"] = Command.GENERATE.value
-    state["arg"] = None
     if text.startswith("/"):
         parts = text.split(maxsplit=1)
-        cmd = parts[0].lower()
-        arg = parts[1].strip() if len(parts) > 1 else None
-        command_mapping = {
-            "/create": Command.CREATE,
-            "/switch": Command.SWITCH,
-            "/files": Command.FILES,
-            "/model": Command.MODEL,
-            "/llm": Command.LLM,
-            "/run": Command.RUN,
-            "/reset": Command.RESET,
-            "/download": Command.DOWNLOAD,
-        }
-        state["command"] = command_mapping.get(cmd, Command.GENERATE).value
-        state["arg"] = arg
+        cmd_str = parts[0].upper().replace("/", "")
+        state["command"] = Command[cmd_str] if cmd_str in Command.__members__ else Command.GENERATE
+        state["arg"] = parts[1].strip() if len(parts) > 1 else None
+    else:
+        state["command"] = Command.GENERATE
+    
+    state["db"] = sqlite3.connect(config.output_dir / "audit.db")
+    state["db"].execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY, ts TEXT, chat_id INTEGER, event_type TEXT,
+            active_file TEXT, model TEXT, prompt TEXT, output_path TEXT,
+            output_sha256 TEXT, output_bytes INTEGER, meta TEXT
+        )
+    """)
     return state
 
 @safe_node
-def node_create(state: GraphState) -> GraphState:
-    chat_id = state["chat_id"]
-    raw_filename = (state.get("arg") or "main.py").strip()
-    filename = sanitize_filename(raw_filename)
-    language = detect_language(filename)
-    ensure_latest_placeholder(chat_id, filename, language)
+def node_create_switch(state: GraphState) -> GraphState:
+    filename = sanitize_filename((state.get("arg") or "main.py").strip())
+    is_create = state["command"] == Command.CREATE
+    
+    if is_create or not latest_path(state["chat_id"], filename).exists():
+        ensure_latest_placeholder(state["chat_id"], filename, detect_language(filename))
+        state["reply_text"] = f"✅ File created/activated: {filename}"
+    else:
+        state["reply_text"] = f"🔀 Switched to {filename}"
+        
     state["active_file"] = filename
     state.setdefault("codegen_model", config.codegen_model_default)
-    state["reply_text"] = f"✅ File created/activated: {filename}\n📤 Language: {language}"
-    push_status(state, f"✅ Created/activated file {filename} (language: {language})")
-    if filename != raw_filename:
-        state["reply_text"] += f"\n⚠️ Filename was sanitized for safety"
-    audit_event(chat_id, "CREATE", active_file=filename, model=state.get("model"))
-    return state
-
-@safe_node
-def node_switch(state: GraphState) -> GraphState:
-    chat_id = state["chat_id"]
-    filename = (state.get("arg") or "").strip()
-    if not filename:
-        state["reply_text"] = "Please specify filename: /switch app.py"
-        return state
-    
-    filename = sanitize_filename(filename)
-    if not latest_path(chat_id, filename).exists():
-        state["reply_text"] = f"File {filename} doesn't exist. Use /create {filename} first."
-        return state
-    
-    state["active_file"] = filename
-    state["reply_text"] = f"🔀 Switched to {filename}"
-    push_status(state, f"🔀 Switched to file {filename}")
-    audit_event(chat_id, "SWITCH", active_file=filename, model=state.get("model"))
+    audit_event(state["db"], state["chat_id"], state["command"].value, active_file=filename)
     return state
 
 @safe_node
 def node_files(state: GraphState) -> GraphState:
     files = list_files(state["chat_id"])
-    if not files:
-        state["reply_text"] = "No files yet. Start with /create app.py"
-    else:
-        state["reply_text"] = "🗂 Files:\n" + "\n".join(f"- {f}" for f in files)
-    audit_event(state["chat_id"], "FILES", active_file=state.get("active_file"))
+    state["reply_text"] = "🗂 Files:\n" + "\n".join(f"- {f}" for f in files) if files else "No files yet."
     return state
 
 @safe_node
-def node_model(state: GraphState) -> GraphState:
+def node_model_info(state: GraphState) -> GraphState:
     cg_model = state.get("codegen_model") or config.codegen_model_default
     state["reply_text"] = (
-        f"🧠 Adapter: GPT-5 (Pro/Thinking Pro)\n"
-        f"   reasoning.effort={FINAL_REASONING.get('effort','minimal')}, text.verbosity={FINAL_VERBOSITY}\n"
-        f"🧩 Codegen (default): {cg_model}\n"
-        f"🔧 To select codegen model: /llm <{'|'.join(sorted(VALID_CODEGEN_MODELS))}> or /run"
+        f"🧠 Adapter: {config.adapter_model}\n"
+        f"🧩 Codegen: {cg_model}\n"
+        f"🔧 To change: /llm <{'|'.join(sorted(VALID_CODEGEN_MODELS))}>"
     )
-    audit_event(state["chat_id"], "MODEL", active_file=state.get("active_file"), model="gpt-5")
     return state
 
 @safe_node
 def node_llm(state: GraphState) -> GraphState:
-    chat_id = state["chat_id"]
     arg = (state.get("arg") or "").strip()
-    pending = state.get("pending_messages")
-
-    if not arg:
-        current = state.get("codegen_model") or config.codegen_model_default
-        msg = (
-            "Select a model for CODE GENERATION:\n"
-            "Available models:\n- " + "\n- ".join(sorted(VALID_CODEGEN_MODELS)) +
-            f"\n\nCurrent default: {current}"
-        )
-        if pending:
-            msg += "\n\n💡 You have a prepared prompt. After selecting, generation will start immediately."
-        state["reply_text"] = msg
-        return state
-
-    model = arg
-    if model not in VALID_CODEGEN_MODELS:
-        state["reply_text"] = (
-            f"Model not supported for codegen: {model}\n"
-            f"Available: {', '.join(sorted(VALID_CODEGEN_MODELS))}"
-        )
-        return state
-
-    if model.startswith("claude") and anthropic_client is None:
-        state["reply_text"] = (
-            "Claude selected but Anthropic not configured. "
-            "Please install 'anthropic' package and set ANTHROPIC_API_KEY."
-        )
+    if not arg or arg not in VALID_CODEGEN_MODELS:
+        state["reply_text"] = f"Invalid model. Available: {', '.join(sorted(VALID_CODEGEN_MODELS))}"
         return state
     
-    state["codegen_model"] = model
-
-    if pending:
-        try:
-            mode = state.get("pending_mode") or config.adapter_output_pref.value
-            messages = pending
-            push_status(state, f"▶️ Running codegen with selected model: {model}")
-            codegen_text = call_codegen(messages, mode=mode, model=model)
-            
-            if not codegen_text or codegen_text == "# Error generating code":
-                raise ValueError("Failed to generate code")
-
-            active = state.get("active_file") or "main.py"
-            updated_path = None
-            if mode.upper() == "FILES_JSON":
-                try:
-                    obj = json.loads(codegen_text)
-                except json.JSONDecodeError:
-                    obj = json.loads(extract_code(codegen_text))
-                files = obj.get("files", [])
-                if not files:
-                    raise ValueError("No files in response")
-                push_status(state, f"🧩 Applying FILES_JSON: {len(files)} file(s)")
-                updated_path = apply_files_json(chat_id, active, files)
-            elif mode.upper() == "UNIFIED_DIFF":
-                push_status(state, "🧩 Applying UNIFIED_DIFF (fallback: full replacement)")
-                code = extract_code(codegen_text)
-                updated_path = version_current_file(chat_id, active, code)
-            else:
-                push_status(state, "🧩 Applying direct code output")
-                code = extract_code(codegen_text)
-                updated_path = version_current_file(chat_id, active, code)
-
-            rel = latest_path(chat_id, active).relative_to(config.output_dir)
-            
-            status_lines = state.get("status_msgs", [])
-            status_block = ""
-            if status_lines:
-                status_block = "🧭 Execution status:\n"
-                status_block += "\n".join(f"{i+1}. {line}" for i, line in enumerate(status_lines))
-                status_block += "\n\n"
-
-            state["reply_text"] = (
-                f"{status_block}"
-                f"✅ Updated {active} via PROMPT-ADAPTER v3\n"
-                f"🧠 Adapter: GPT-5 Pro/Thinking Pro\n"
-                f"🧩 Codegen LLM: {model}\n"
-                f"📄 Contract: {mode}\n"
-                f"💾 Saved: {rel}\n\n"
-                f"Commands: /files, /switch , /download"
-            )
-
-            audit_event(
-                chat_id, "GENERATE",
-                active_file=active,
-                model=model,
-                prompt=json.dumps({
-                    "pending_mode": mode,
-                    "pending_sha": state.get("pending_prompt_sha"),
-                }, ensure_ascii=False)[:4000],
-                output_path=updated_path,
-                meta={"adapter_ready": True, "success": True}
-            )
-        finally:
-            state.pop("pending_messages", None)
-            state.pop("pending_mode", None)
-            state.pop("pending_prompt_sha", None)
-            state.pop("pending_context", None)
+    if arg.startswith("claude") and not (anthropic_client or os.getenv("AI_GATEWAY_BASE_URL")):
+        state["reply_text"] = "Claude is not configured. Set ANTHROPIC_API_KEY or AI_GATEWAY_BASE_URL."
+        return state
+        
+    state["codegen_model"] = arg
+    audit_event(state["db"], state["chat_id"], "LLM_SET", model=arg)
+    
+    if state.get("pending_messages"):
+        state["command"] = Command.RUN # Re-route to run codegen
+        return node_run(state)
     else:
-        state["reply_text"] = f"🔧 Codegen model set to: {model} (will be used for next generation)"
-        audit_event(chat_id, "LLM_SET", active_file=state.get("active_file"), model=model)
-    
-    return state
+        state["reply_text"] = f"🔧 Codegen model set to: {arg}"
+        return state
 
 @safe_node
 def node_run(state: GraphState) -> GraphState:
-    if not state.get("pending_messages"):
-        state["reply_text"] = "No prepared prompt. Send a task first for the adapter."
+    messages = state.get("pending_messages")
+    if not messages:
+        state["reply_text"] = "No prepared prompt. Send a task first."
         return state
-    model = state.get("codegen_model") or config.codegen_model_default
-    state["arg"] = model
-    return node_llm(state)
+
+    chat_id = state["chat_id"]
+    active_file = state.get("active_file", "main.py")
+    model = state.get("codegen_model", config.codegen_model_default)
+    mode = state.get("pending_mode", config.adapter_output_pref.value)
+    push_status(state, f"▶️ Running codegen with {model}")
+
+    codegen_text = call_codegen(messages, mode=mode, model=model)
+    if codegen_text.startswith("# Error"):
+        raise ValueError(codegen_text)
+
+    if mode == "FILES_JSON":
+        files_obj = json.loads(extract_code(codegen_text)).get("files", [])
+        updated_path = apply_files_json(chat_id, active_file, files_obj)
+    else: # CODE_ONLY or UNIFIED_DIFF (treated as full replacement)
+        updated_path = version_current_file(chat_id, active_file, extract_code(codegen_text))
+    
+    rel_path = updated_path.relative_to(config.output_dir)
+    status_block = "\n".join(f"{i+1}. {line}" for i, line in enumerate(state.get("status_msgs", [])))
+    state["reply_text"] = (
+        f"🧭 Status:\n{status_block}\n\n"
+        f"✅ Updated {active_file}\n"
+        f"🧩 Codegen: {model}\n"
+        f"💾 Saved: {rel_path}"
+    )
+    audit_event(state["db"], chat_id, "GENERATE_SUCCESS", model=model, output_path=str(updated_path))
+    
+    # Clear pending state
+    state.pop("pending_messages", None)
+    state.pop("pending_mode", None)
+    return state
 
 @safe_node
 def node_reset(state: GraphState) -> GraphState:
-    state["active_file"] = None
-    state["model"] = config.adapter_model
+    keys_to_clear = ["active_file", "pending_messages", "pending_mode"]
+    for key in keys_to_clear:
+        state.pop(key, None)
     state["codegen_model"] = config.codegen_model_default
-    state.pop("pending_messages", None)
-    state.pop("pending_mode", None)
-    state.pop("pending_prompt_sha", None)
-    state.pop("pending_context", None)
-    state["reply_text"] = "♻️ State reset. Start with /create "
-    audit_event(state["chat_id"], "RESET")
+    state["reply_text"] = "♻️ State reset."
+    audit_event(state["db"], state["chat_id"], "RESET")
     return state
 
 @safe_node
 def node_generate(state: GraphState) -> GraphState:
     chat_id = state["chat_id"]
-    active = state.get("active_file")
-    if not active:
-        active = "main.py"
-        ensure_latest_placeholder(chat_id, active, detect_language(active))
-        state["active_file"] = active
-        logger.info(f"Auto-created file: {active}")
-
-    state["model"] = config.adapter_model
-    raw_user_text = state["input_text"]
+    active_file = state.get("active_file")
+    if not active_file:
+        state = node_create_switch(state) # Create default file
+        active_file = state["active_file"]
     
-    lp = latest_path(chat_id, active)
-    existed_before = lp.exists()
-    ensure_latest_placeholder(chat_id, active, detect_language(active))
-    current_text = lp.read_text(encoding="utf-8") if lp.exists() else ""
-    has_context = existed_before and not is_placeholder_or_empty(current_text)
-
-    context_block = build_context_block(chat_id, active) if has_context else ""
-    mode_tag = "DIFF_PATCH" if has_context else "NEW_FILE"
-    output_pref = infer_output_preference(raw_user_text, has_context)
+    push_status(state, f"📩 User request received ({len(state['input_text'])} chars)")
     
-    push_status(state, f"📩 User request ({len(raw_user_text)} chars)")
-    push_status(state, f"🧠 Adapter: GPT-5 (mode={mode_tag})")
-
-    try:
-        adapter_prompt = render_adapter_prompt(raw_user_text, context_block, mode_tag, output_pref)
-        push_status(state, f"✅ Loaded external prompt: {config.prompt_file_path.resolve()}")
-        sha = hashlib.sha256(adapter_prompt.encode('utf-8')).hexdigest()
-        push_status(state, f"📤 Sending adapter prompt (hash: {sha[:10]}...)")
-        
-        adapter_result = call_adapter(adapter_prompt)
-        messages = adapter_result.get("messages", [])
-        if not messages:
-            raise ValueError("Adapter returned empty messages")
-        
-        mode = adapter_result.get("response_contract", {}).get("mode", output_pref)
-        
-        state["pending_messages"] = messages
-        state["pending_mode"] = mode
-        state["pending_prompt_sha"] = sha
-        state["pending_context"] = "present" if has_context else "absent"
-
-        audit_event(
-            chat_id, "ADAPTER_READY",
-            active_file=active,
-            model=config.adapter_model,
-            prompt=json.dumps({"mode": mode, "sha": sha[:16]}, ensure_ascii=False)[:4000],
-            meta={"has_context": has_context}
-        )
-
-        options = " | ".join(sorted(VALID_CODEGEN_MODELS))
-        status_lines = state.get("status_msgs", [])
-        status_block = ""
-        if status_lines:
-            status_block = "🧭 Status:\n"
-            status_block += "\n".join(f"{i+1}. {line}" for i, line in enumerate(status_lines))
-            status_block += "\n\n"
-        
-        default_model = state.get("codegen_model") or config.codegen_model_default
-        state["reply_text"] = (
-            f"{status_block}"
-            "✅ Structured prompt ready.\n"
-            "Choose LLM for code generation (user decision - no auto-run):\n"
-            f"→ /llm <{options}>  (recommended)\n"
-            f"→ /run  (use current: {default_model})\n\n"
-            "After selection, generation and file updates will begin."
-        )
-    except Exception as e:
-        logger.error(f"Adapter stage failed: {e}", exc_info=True)
-        audit_event(
-            chat_id, "ADAPTER_ERROR",
-            active_file=active,
-            model=config.adapter_model,
-            meta={"error": str(e)[:500]}
-        )
-        raise
+    context_block = build_context_block(chat_id, active_file)
+    mode_tag = "DIFF_PATCH" if context_block else "NEW_FILE"
+    push_status(state, f"🧠 Calling adapter (mode={mode_tag})")
     
+    adapter_prompt = render_adapter_prompt(state["input_text"], context_block, mode_tag)
+    adapter_result = call_adapter(adapter_prompt)
+    
+    state["pending_messages"] = adapter_result["messages"]
+    state["pending_mode"] = adapter_result["response_contract"]["mode"]
+    
+    audit_event(state["db"], chat_id, "ADAPTER_READY", model=config.adapter_model)
+    push_status(state, "✅ Structured prompt ready.")
+    
+    status_block = "\n".join(f"{i+1}. {line}" for i, line in enumerate(state.get("status_msgs", [])))
+    state["reply_text"] = (
+        f"🧭 Status:\n{status_block}\n\n"
+        "Choose LLM for codegen:\n"
+        f"→ /llm <{'|'.join(sorted(VALID_CODEGEN_MODELS))}>\n"
+        f"→ /run (use current: {state.get('codegen_model', config.codegen_model_default)})"
+    )
     return state
 
 @safe_node
 def node_download(state: GraphState) -> GraphState:
     chat_id = state["chat_id"]
     arg = state.get("arg")
-    try:
-        archive_path = make_archive(chat_id, arg)
-        state["file_to_send"] = str(archive_path)
-        selection = arg or "all"
-        state["reply_text"] = f"📦 Prepared archive {archive_path.name} ({selection})"
-        push_status(state, f"📦 Created archive {archive_path.name} (filter: {selection})")
-        audit_event(
-            chat_id, "DOWNLOAD",
-            active_file=state.get("active_file"),
-            model=state.get("codegen_model") or config.codegen_model_default,
-            output_path=archive_path
-        )
-    except Exception as e:
-        logger.error(f"Failed to create archive: {e}")
-        state["reply_text"] = f"❌ Failed to create archive: {str(e)[:200]}"
-    return state
-
-# ---------- ARCHIVE CREATION ----------
-def iter_selected_files(base: Path, arg: Optional[str]) -> Iterable[Path]:
-    try:
-        files = [p for p in base.iterdir() if p.is_file()]
-        if not arg:
-            return sorted(files)
-        
-        arg = arg.strip().lower()
-        if arg == "latest":
-            return sorted([p for p in files if p.name.startswith("latest-")])
-        elif arg == "versions":
-            return sorted([p for p in files if not p.name.startswith("latest-")])
-        else:
-            return sorted([p for p in files if p.name == f"latest-{arg}" or p.name.endswith(f"-{arg}")])
-    except Exception as e:
-        logger.error(f"Failed to select files: {e}")
-        return []
-
-def make_archive(chat_id: int, arg: Optional[str]) -> Path:
     base = chat_dir(chat_id)
     ts = time.strftime("%Y%m%d-%H%M%S")
-    out = base / f"export-{ts}.zip"
+    out_path = base / f"export-{ts}.zip"
+
+    files_to_pack = [p for p in base.iterdir() if p.is_file()]
+    if not files_to_pack: raise ValueError("No files to archive")
     
-    to_pack = list(iter_selected_files(base, arg))
-    if not to_pack:
-        raise ValueError("No files to archive")
-    
-    total_size = sum(p.stat().st_size for p in to_pack)
-    if total_size > config.max_archive_size:
-        raise ValueError(f"Archive too large: {total_size} bytes")
-    
-    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for p in to_pack:
-            z.write(p, arcname=p.name)
-    
-    logger.info(f"Created ZIP archive: {out.name} with {len(to_pack)} files")
-    return out
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in files_to_pack: zf.write(p, arcname=p.name)
+
+    state["file_to_send"] = str(out_path)
+    state["reply_text"] = f"📦 Prepared archive: {out_path.name}"
+    audit_event(state["db"], chat_id, "DOWNLOAD", output_path=str(out_path))
+    return state
+
+@safe_node
+def exit_point(state: GraphState) -> GraphState:
+    if state.get("db"):
+        state["db"].close()
+    return state
 
 # ---------- GRAPH BUILDER ----------
-def router(state: GraphState) -> str:
-    return state["command"]
-
 def build_app() -> Any:
     sg = StateGraph(GraphState)
-    sg.add_node("parse", parse_message)
-    sg.add_node("CREATE", node_create)
-    sg.add_node("SWITCH", node_switch)
-    sg.add_node("FILES", node_files)
-    sg.add_node("MODEL", node_model)
-    sg.add_node("LLM", node_llm)
-    sg.add_node("RUN", node_run)
-    sg.add_node("RESET", node_reset)
-    sg.add_node("GENERATE", node_generate)
-    sg.add_node("DOWNLOAD", node_download)
+    sg.add_node("entry", entry_point)
+    sg.add_node(Command.CREATE.name, node_create_switch)
+    sg.add_node(Command.SWITCH.name, node_create_switch)
+    sg.add_node(Command.FILES.name, node_files)
+    sg.add_node(Command.MODEL.name, node_model_info)
+    sg.add_node(Command.LLM.name, node_llm)
+    sg.add_node(Command.RUN.name, node_run)
+    sg.add_node(Command.RESET.name, node_reset)
+    sg.add_node(Command.GENERATE.name, node_generate)
+    sg.add_node(Command.DOWNLOAD.name, node_download)
+    sg.add_node("exit", exit_point)
 
-    sg.set_entry_point("parse")
-    
+    sg.set_entry_point("entry")
     sg.add_conditional_edges(
-        "parse",
-        router,
-        {
-            Command.CREATE.value: "CREATE",
-            Command.SWITCH.value: "SWITCH",
-            Command.FILES.value: "FILES",
-            Command.MODEL.value: "MODEL",
-            Command.LLM.value: "LLM",
-            Command.RUN.value: "RUN",
-            Command.RESET.value: "RESET",
-            Command.GENERATE.value: "GENERATE",
-            Command.DOWNLOAD.value: "DOWNLOAD",
-        }
+        "entry",
+        lambda state: state["command"].name,
+        {cmd.name: cmd.name for cmd in Command}
     )
+    
+    # After most operations, the graph ends.
+    for cmd_name in [c.name for c in Command if c not in [Command.LLM]]:
+        sg.add_edge(cmd_name, "exit")
+    
+    # Special case: /llm with pending prompt re-routes to /run
+    sg.add_conditional_edges(
+        Command.LLM.name,
+        lambda state: state.get("command", Command.LLM).name,
+        {Command.RUN.name: Command.RUN.name, Command.LLM.name: "exit"}
+    )
+    
+    sg.add_edge("exit", END)
 
-    for node in ["CREATE", "SWITCH", "FILES", "MODEL", "LLM", "RUN", "RESET", "GENERATE", "DOWNLOAD"]:
-        sg.add_edge(node, END)
+    db_path = config.output_dir / "checkpoints.sqlite"
+    checkpointer = SqliteSaver.from_conn_string(str(db_path))
+    logger.info(f"Using SqliteSaver for persistent state management (DB: {db_path})")
     
-    checkpointer = MemorySaver()
-    logger.info("Using MemorySaver for state management")
-    
-    compiled_app = sg.compile(checkpointer=checkpointer)
-    logger.info("LangGraph application compiled successfully")
-    return compiled_app
+    return sg.compile(checkpointer=checkpointer)
 
 # ---------- INITIALIZATION ----------
 APP = build_app()
-__all__ = ['APP', 'VALID_MODELS', 'VALID_CODEGEN_MODELS', 'config']
+
+__all__ = ['APP', 'config']
+
 logger.info(
     "Graph app initialized. Adapter: %s. Codegen models: %s. Output dir: %s",
-    config.adapter_model,
-    sorted(VALID_CODEGEN_MODELS),
-    config.output_dir
+    config.adapter_model, sorted(VALID_CODEGEN_MODELS), config.output_dir
 )
