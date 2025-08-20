@@ -178,54 +178,39 @@ async def check_authorization(update: Update) -> bool:
 # Helpers
 # =========================
 async def invoke_graph_with_retry(
-     chat_id: int, 
-     text: str,
-     max_retries: int = 3
- ) -> Dict[str, Any]:
-     """Invoke graph with retry logic."""
-     state = {"chat_id": chat_id, "input_text": text}
--    
-+    # LangGraph checkpointer требует хотя бы configurable.thread_id
-+    cfg = {
-+        "configurable": {
-+            "thread_id": f"tg-{chat_id}",
-+            # опционально: пространство имён, если несколько ботов/инстансов
-+            "checkpoint_ns": os.getenv("CHECKPOINT_NS", "prod-bot"),
-+        }
-+    }
-+
-     for attempt in range(max_retries):
-         try:
-             # Run in executor to avoid blocking
-             loop = asyncio.get_running_loop()
-             result: Dict[str, Any] = await loop.run_in_executor(
-                 None, 
--                lambda: APP.invoke(state)
-+                lambda: APP.invoke(state, config=cfg)
-             )
-             return result or {}
-def detect_llm_choice_needed(reply: str) -> bool:
-     """Check if response indicates LLM choice is needed."""
--    markers = [
--        "Structured prompt ready",
--        "Choose LLM for code generation",
--        "→ /llm",
--        "→ /run",
--        "user decision",
--    ]
-+    markers = [
-+        # EN
-+        "Structured prompt ready",
-+        "Choose LLM for code generation",
-+        "→ /llm",
-+        "→ /run",
-+        "user decision",
-+        # RU (совпадает с сообщениями из графа)
-+        "Структурированный промпт готов",
-+        "Выберите LLM для генерации кода",
-+        "Использовать текущую",
-+    ]
-         return any(marker in reply for marker in markers)
+    chat_id: int, 
+    text: str,
+    max_retries: int = 3
+) -> Dict[str, Any]:
+    """Invoke graph with retry logic."""
+    state = {"chat_id": chat_id, "input_text": text}
+    
+    # LangGraph checkpointer требует хотя бы configurable.thread_id
+    cfg = {
+        "configurable": {
+            "thread_id": f"tg-{chat_id}",
+            # опционально: пространство имён, если несколько ботов/инстансов
+            "checkpoint_ns": os.getenv("CHECKPOINT_NS", "prod-bot"),
+        }
+    }
+    
+    for attempt in range(max_retries):
+        try:
+            # Run in executor to avoid blocking
+            loop = asyncio.get_running_loop()
+            result: Dict[str, Any] = await loop.run_in_executor(
+                None, 
+                lambda: APP.invoke(state, config=cfg)
+            )
+            return result or {}
+            
+        except Exception as e:
+            logger.error(f"Graph invoke attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(config.error_retry_delay * (attempt + 1))
+    
+    return {}
 
 async def send_long_message(
     update: Update,
@@ -298,11 +283,16 @@ async def send_long_message(
 def detect_llm_choice_needed(reply: str) -> bool:
     """Check if response indicates LLM choice is needed."""
     markers = [
+        # EN
         "Structured prompt ready",
         "Choose LLM for code generation",
         "→ /llm",
         "→ /run",
         "user decision",
+        # RU (совпадает с сообщениями из графа)
+        "Структурированный промпт готов",
+        "Выберите LLM для генерации кода",
+        "Использовать текущую",
     ]
     return any(marker in reply for marker in markers)
 
@@ -666,6 +656,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
         sys.exit(1)
-
-
-
