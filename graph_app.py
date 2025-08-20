@@ -131,7 +131,7 @@ def ensure_latest_placeholder(chat_id: int, filename: str, language: str) -> Pat
         'python':      "# -*- coding: utf-8 -*-\n# created via /create\n",
         'javascript':  "// created via /create\n",
         'typescript':  "// created via /create\n",
-        'html':        "\n",
+        'html':        "<!-- created via /create -->\n",
         'css':         "/* created via /create */\n",
         'json':        "{\n}\n",
         'yaml':        "# created via /create\n",
@@ -336,7 +336,7 @@ Principles:
     ]
   },
   "runbook":{
-    "plan":["step 1","step 2","step 3"],            // brief, no CoT
+    "plan":["step 1","step 2","step 3"],           // brief, no CoT
     "commands":["<install/build/test cmds>"],
     "tests_hint":"what to cover if TEST_POLICY=TDD"
   },
@@ -382,12 +382,12 @@ Principles:
 [DYNAMIC INPUT — fill at call-time]
 RAW_TASK: <<<RAW_TASK>>>
 CONTEXT (optional): <<<CONTEXT>>>
-MODE: <<<MODE>>>                       // NEW_FILE | DIFF_PATCH | MULTIFILE_TOOLS
-TARGETS: <<<TARGETS>>>                 // lang versions/linters/deps
-CONSTRAINTS: <<<CONSTRAINTS>>>             // perf/security/licenses
-TEST_POLICY: <<<TEST_POLICY>>>             // TDD | NO_TESTS
-OUTPUT_PREF: <<<OUTPUT_PREF>>>             // FILES_JSON | UNIFIED_DIFF | TOOLS_CALLS
-OUTPUT_LANG: <<<OUTPUT_LANG>>>             // e.g., RU for UI strings
+MODE: <<<MODE>>>                          // NEW_FILE | DIFF_PATCH | MULTIFILE_TOOLS
+TARGETS: <<<TARGETS>>>                    // lang versions/linters/deps
+CONSTRAINTS: <<<CONSTRAINTS>>>            // perf/security/licenses
+TEST_POLICY: <<<TEST_POLICY>>>            // TDD | NO_TESTS
+OUTPUT_PREF: <<<OUTPUT_PREF>>>            // FILES_JSON | UNIFIED_DIFF | TOOLS_CALLS
+OUTPUT_LANG: <<<OUTPUT_LANG>>>            // e.g., RU for UI strings
 
 [NOW DO]
 Construct and return ONE JSON object strictly matching OUTPUT SCHEMA, with developer in English and user containing both RAW and EN_ADAPT, following the English Adaptation Policy.
@@ -402,25 +402,22 @@ def _build_context_block(chat_id: int, filename: str) -> str:
     code = lp.read_text(encoding="utf-8")
     return f"<<<CONTEXT:FILE {filename}>>>\n```{lang}\n{code}\n```\n<<<END>>>"
 
+def _render_adapter_prompt(raw_task: str, context_block: str, mode_tag: str, targets: str, constraints: str, test_policy: str, output_pref: str, output_lang: str) -> str:
+    """Render the adapter prompt by replacing placeholders."""
+    prompt = PROMPT_ADAPTER_V3
+    prompt = prompt.replace("<<<RAW_TASK>>>", raw_task)
+    prompt = prompt.replace("<<<CONTEXT>>>", context_block)
+    prompt = prompt.replace("<<<MODE>>>", mode_tag)
+    prompt = prompt.replace("<<<TARGETS>>>", targets)
+    prompt = prompt.replace("<<<CONSTRAINTS>>>", constraints)
+    prompt = prompt.replace("<<<TEST_POLICY>>>", test_policy)
+    prompt = prompt.replace("<<<OUTPUT_PREF>>>", output_pref)
+    prompt = prompt.replace("<<<OUTPUT_LANG>>>", output_lang)
+    return prompt
+
 def _call_adapter(raw_task: str, context_block: str, mode_tag: str, output_pref: str) -> dict:
     """Вызов PROMPT-ADAPTER для подготовки промпта"""
-    adapter_prompt = PROMPT_ADAPTER_V3.replace(
-        "<<<RAW_TASK>>>", raw_task
-    ).replace(
-        "<<<CONTEXT>>>", context_block
-    ).replace(
-        "<<<MODE>>>", mode_tag
-    ).replace(
-        "<<<TARGETS>>>", ADAPTER_TARGETS
-    ).replace(
-        "<<<CONSTRAINTS>>>", ADAPTER_CONSTRAINTS
-    ).replace(
-        "<<<TEST_POLICY>>>", ADAPTER_TEST_POLICY
-    ).replace(
-        "<<<OUTPUT_PREF>>>", output_pref
-    ).replace(
-        "<<<OUTPUT_LANG>>>", ADAPTER_OUTPUT_LANG
-    )
+    adapter_prompt = _render_adapter_prompt(raw_task, context_block, mode_tag, ADAPTER_TARGETS, ADAPTER_CONSTRAINTS, ADAPTER_TEST_POLICY, output_pref, ADAPTER_OUTPUT_LANG)
     
     try:
         # Вызываем OpenAI API с GPT-5
@@ -466,7 +463,6 @@ def _call_codegen_from_messages(messages: list[dict]) -> str:
             if role == "developer":
                 role = "system"
             norm.append({"role": role, "content": m.get("content", "")})
-        
         response = _openai_create(CODEGEN_MODEL, norm)
         
         # Извлекаем текст из ответа
@@ -590,7 +586,7 @@ class InMsg(BaseModel):
 class GraphState(TypedDict, total=False):
     chat_id: int
     input_text: str
-    command: str              # CREATE | SWITCH | FILES | MODEL | RESET | GENERATE | DOWNLOAD
+    command: str               # CREATE | SWITCH | FILES | MODEL | RESET | GENERATE | DOWNLOAD
     arg: Optional[str]
     active_file: Optional[str]
     model: str
@@ -828,36 +824,25 @@ def node_generate(state: GraphState) -> GraphState:
 
     return state
 
-def _make_zip(chat_id: int, selection: Optional[str]) -> Path:
-    """Создание zip архива из файлов чата."""
-    base_dir = chat_dir(chat_id)
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    zip_filename = f"archive-{chat_id}-{ts}.zip"
-    zip_path = base_dir / zip_filename
-
-    files_to_add = []
-    if selection:
-        # Sanitize and add a specific file
-        selected_file = sanitize_filename(selection)
-        latest_file_path = base_dir / f"latest-{selected_file}"
-        if latest_file_path.exists():
-            files_to_add.append(latest_file_path)
-        else:
-            raise FileNotFoundError(f"File '{selected_file}' not found.")
-    else:
-        # Add all 'latest-' files
-        files_to_add = list(base_dir.glob("latest-*"))
-
-    if not files_to_add:
-        raise ValueError("No files to archive.")
-
+def _make_zip(chat_id: int, selector: Optional[str] = None) -> Path:
+    """Создание ZIP-архива файлов чата."""
+    base = chat_dir(chat_id)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    zip_path = OUTPUT_DIR / f"chat_{chat_id}_{ts}.zip"
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for file_path in files_to_add:
-            # Add file with a clean name inside the archive (e.g., 'main.py' instead of 'latest-main.py')
-            arcname = file_path.name.replace("latest-", "", 1)
-            zf.write(file_path, arcname=arcname)
-            logger.info(f"Adding {arcname} to archive.")
-
+        if selector:
+            safe_selector = sanitize_filename(selector)
+            p = base / safe_selector
+            if p.exists() and p.is_file():
+                zf.write(p, arcname=p.name)
+            else:
+                for fp in base.glob(f"*{safe_selector}*"):
+                    if fp.is_file():
+                        zf.write(fp, arcname=fp.name)
+        else:
+            for fp in base.iterdir():
+                if fp.is_file():
+                    zf.write(fp, arcname=fp.name)
     return zip_path
 
 @safe_node
@@ -882,6 +867,8 @@ def node_download(state: GraphState) -> GraphState:
 def router(state: GraphState) -> str:
     """Роутер для определения следующего узла"""
     return state["command"]
+
+# Замените функцию build_app() в graph_app.py на эту исправленную версию:
 
 def build_app():
     """Сборка LangGraph приложения с checkpointer"""
