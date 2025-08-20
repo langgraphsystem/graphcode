@@ -1,0 +1,7 @@
+python-telegram-bot==20.7
+langgraph>=0.2.30
+langchain>=0.2.14
+openai>=1.43.0
+python-dotenv>=1.0.1
+pydantic>=2.7.1
+tenacity>=8.2.3
