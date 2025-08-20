@@ -1,27 +1,13 @@
+```python
 from __future__ import annotations
 import os, re, time, hashlib, sqlite3, zipfile, json, logging
 from pathlib import Path
 from typing import TypedDict, Optional, Iterable
-
 from langgraph.graph import StateGraph, END
-
-# Чекпойнтер: используем только MemorySaver для избежания проблем с SQLite
 from langgraph.checkpoint.memory import MemorySaver
-_CHECKPOINTER_KIND = "memory"
-
-# Если хотите попробовать SQLite (может вызывать ошибки):
-# try:
-#     from langgraph.checkpoint.sqlite import SqliteSaver
-#     import sqlite3
-#     _CHECKPOINTER_KIND = "sqlite"
-# except Exception as e:
-#     print(f"SQLite checkpointer not available: {e}")
-#     from langgraph.checkpoint.memory import MemorySaver
-#     _CHECKPOINTER_KIND = "memory"
-
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import OpenAI, APIError
 
 # ---------- НАСТРОЙКА ЛОГИРОВАНИЯ ----------
 logging.basicConfig(
@@ -34,22 +20,18 @@ logger = logging.getLogger(__name__)
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./out")).resolve()
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ВАЖНО: Используем только GPT-5 как основную модель
 DEFAULT_MODEL = "gpt-5"
-VALID_MODELS = {"gpt-5"}  # Только GPT-5 поддерживается
-
+VALID_MODELS = {"gpt-5"}
 REQUEST_TIMEOUT = int(os.getenv("OPENAI_REQUEST_TIMEOUT", "300"))
 
-# Параметры PROMPT-ADAPTER (можно переопределять в Railway Variables)
 ADAPTER_MODEL = os.getenv("ADAPTER_MODEL", DEFAULT_MODEL)
 CODEGEN_MODEL = os.getenv("CODEGEN_MODEL", DEFAULT_MODEL)
 ADAPTER_TARGETS = os.getenv("ADAPTER_TARGETS", "Python 3.11; Ruff+Black; Pydantic v2; asyncio; type hints strict")
 ADAPTER_CONSTRAINTS = os.getenv("ADAPTER_CONSTRAINTS", "No secrets; reasonable perf; minimal deps")
 ADAPTER_TEST_POLICY = os.getenv("ADAPTER_TEST_POLICY", "NO_TESTS")
 ADAPTER_OUTPUT_LANG = os.getenv("ADAPTER_OUTPUT_LANG", "EN")
-ADAPTER_OUTPUT_PREF = os.getenv("ADAPTER_OUTPUT_PREF", "FILES_JSON")  # FILES_JSON | UNIFIED_DIFF | TOOLS_CALLS
+ADAPTER_OUTPUT_PREF = os.getenv("ADAPTER_OUTPUT_PREF", "FILES_JSON")
 
-# Глобальный клиент OpenAI
 openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
     timeout=REQUEST_TIMEOUT
@@ -64,69 +46,50 @@ EXT2LANG = {
 }
 
 def detect_language(filename: str) -> str:
-    """Определение языка по расширению файла"""
     return EXT2LANG.get(Path(filename).suffix.lower(), "text")
 
 def sanitize_filename(filename: str) -> str:
-    """Очистка имени файла от небезопасных символов"""
     unsafe_chars = ['..', '/', '\\', ':', '*', '?', '"', '<', '>', '|', '\x00']
     clean_name = filename
     for char in unsafe_chars:
         clean_name = clean_name.replace(char, '_')
-    
-    # Ограничиваем длину
     max_length = 255
     if len(clean_name) > max_length:
         name, ext = os.path.splitext(clean_name)
         clean_name = name[:max_length - len(ext)] + ext
-    
-    # Если имя пустое после очистки
     if not clean_name or clean_name.strip() in ['.', '..']:
         clean_name = 'unnamed_file'
-    
     return clean_name.strip()
 
 def safe_path_join(base_dir: Path, relative_path: str) -> Optional[Path]:
-    """Безопасное объединение путей с проверкой выхода за пределы базовой директории"""
     try:
         clean_path = relative_path.strip().lstrip('/\\')
-        
-        # Проверяем на path traversal
         if '..' in clean_path or clean_path.startswith('/'):
             logger.warning(f"Potentially unsafe path rejected: {relative_path}")
             return None
-        
         full_path = base_dir / clean_path
-        
-        # Проверяем, что путь находится внутри базовой директории
         try:
             full_path.resolve().relative_to(base_dir.resolve())
         except ValueError:
             logger.warning(f"Path outside base directory rejected: {relative_path}")
             return None
-        
         return full_path
-        
     except Exception as e:
         logger.error(f"Error processing path: {e}")
         return None
 
 def chat_dir(chat_id: int) -> Path:
-    """Получение директории чата"""
     p = OUTPUT_DIR / str(chat_id)
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 def latest_path(chat_id: int, filename: str) -> Path:
-    """Путь к последней версии файла"""
     return chat_dir(chat_id) / f"latest-{filename}"
 
 def ensure_latest_placeholder(chat_id: int, filename: str, language: str) -> Path:
-    """Создание файла-заглушки если его нет"""
     lp = latest_path(chat_id, filename)
     if lp.exists():
         return lp
-    
     stubs = {
         'python':      "# -*- coding: utf-8 -*-\n# created via /create\n",
         'javascript':  "// created via /create\n",
@@ -142,7 +105,6 @@ def ensure_latest_placeholder(chat_id: int, filename: str, language: str) -> Pat
         'java':        "// created via /create\npublic class Main {}\n",
         'text':        "",
     }
-    
     try:
         lp.write_text(stubs.get(language, ""), encoding="utf-8")
     except Exception:
@@ -150,33 +112,24 @@ def ensure_latest_placeholder(chat_id: int, filename: str, language: str) -> Pat
     return lp
 
 def list_files(chat_id: int) -> list[str]:
-    """Список файлов в директории чата"""
     base = chat_dir(chat_id)
     return sorted([p.name for p in base.iterdir() if p.is_file()])
 
 def _sha256_bytes(data: bytes) -> str:
-    """SHA256 хеш байтов"""
     return hashlib.sha256(data).hexdigest()
 
 def _sha256_file(path: Path) -> str:
-    """SHA256 хеш файла"""
     return _sha256_bytes(path.read_bytes())
 
 def version_current_file(chat_id: int, filename: str, new_content: str) -> Path:
-    """Версионирование файла с временной меткой"""
     lp = latest_path(chat_id, filename)
     old = lp.read_text(encoding="utf-8") if lp.exists() else ""
-    
-    # Если содержимое не изменилось, не создаем новую версию
     if hashlib.sha256(old.encode()).hexdigest() == hashlib.sha256(new_content.encode()).hexdigest():
         return lp
-    
-    # Создаем версию с временной меткой
     ts = time.strftime("%Y%m%d-%H%M%S")
     ver = chat_dir(chat_id) / f"{ts}-{filename}"
     ver.write_text(new_content, encoding="utf-8")
     lp.write_text(new_content, encoding="utf-8")
-    
     logger.info(f"Created version: {ver.name}")
     return lp
 
@@ -187,30 +140,25 @@ UNIFIED_DIFF_HINT_RE = re.compile(r"(?m)^(--- |\+\+\+ |@@ )")
 GIT_DIFF_HINT_RE = re.compile(r"(?m)^diff --git ")
 
 def extract_code(text: str) -> str:
-    """Извлечение кода из markdown блока"""
     m = CODE_BLOCK_RE.search(text)
     if not m:
         return text.strip()
     return m.group(2).strip()
 
 def extract_diff_and_spec(text: str) -> tuple[str, str]:
-    """Извлечение diff и спецификации из текста"""
     diff_parts: list[str] = []
     def _grab(m: re.Match) -> str:
         diff_parts.append(m.group(2).strip())
         return ""
     text_wo = DIFF_BLOCK_RE.sub(_grab, text)
     diff_text = "\n\n".join(diff_parts).strip()
-    
     if not diff_text and (GIT_DIFF_HINT_RE.search(text_wo) or UNIFIED_DIFF_HINT_RE.search(text_wo)):
         return "", text_wo.strip()
-    
     return text_wo.strip(), diff_text
 
 PLACEHOLDER_HINT = "created via /create"
 
 def _is_placeholder_or_empty(content: str) -> bool:
-    """Проверка, является ли файл заглушкой"""
     if not content.strip(): 
         return True
     if PLACEHOLDER_HINT in content: 
@@ -220,24 +168,17 @@ def _is_placeholder_or_empty(content: str) -> bool:
 # ---------- OpenAI API ВЫЗОВЫ ----------
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
-    retry=retry_if_exception_type(Exception),
+    wait=wait_exponential(multiplier=2, min=2, max=16),
+    retry=retry_if_exception_type((APIError, ConnectionError)),
     reraise=True
 )
 def _openai_create(model: str, input_payload):
-    """
-    Универсальная функция для вызова OpenAI API с GPT-5
-    """
-    # Всегда используем GPT-5
     model = "gpt-5"
-    
-    # Если это список сообщений или словарь с messages
     if isinstance(input_payload, list):
         messages = input_payload
     elif isinstance(input_payload, dict) and "messages" in input_payload:
         messages = input_payload["messages"]
     else:
-        # Если это строка, оборачиваем в формат chat completion
         messages = [{"role": "user", "content": str(input_payload)}]
     
     try:
@@ -245,14 +186,20 @@ def _openai_create(model: str, input_payload):
         response = openai_client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=4096,
+            max_tokens=2048,
             temperature=0.2,
         )
-        
         return response
-        
+    except APIError as e:
+        logger.error(f"OpenAI API error: {e}, HTTP status: {e.http_status}, Headers: {e.headers}")
+        if e.http_status == 429:
+            logger.warning("Rate limit error detected")
+        raise
+    except ConnectionError as e:
+        logger.error(f"Network error: {e}")
+        raise
     except Exception as e:
-        logger.error(f"OpenAI API error: {e}")
+        logger.error(f"Unexpected error in OpenAI call: {e}")
         raise
 
 # ---------- PROMPT-ADAPTER V3 ШАБЛОН ----------
@@ -336,7 +283,7 @@ Principles:
     ]
   },
   "runbook":{
-    "plan":["step 1","step 2","step 3"],           // brief, no CoT
+    "plan":["step 1","step 2","step 3"],
     "commands":["<install/build/test cmds>"],
     "tests_hint":"what to cover if TEST_POLICY=TDD"
   },
@@ -394,7 +341,6 @@ Construct and return ONE JSON object strictly matching OUTPUT SCHEMA, with devel
 """
 
 def _build_context_block(chat_id: int, filename: str) -> str:
-    """Построение блока контекста для файла"""
     lp = latest_path(chat_id, filename)
     if not lp.exists():
         return ""
@@ -403,7 +349,6 @@ def _build_context_block(chat_id: int, filename: str) -> str:
     return f"<<<CONTEXT:FILE {filename}>>>\n```{lang}\n{code}\n```\n<<<END>>>"
 
 def _render_adapter_prompt(raw_task: str, context_block: str, mode_tag: str, targets: str, constraints: str, test_policy: str, output_pref: str, output_lang: str) -> str:
-    """Render the adapter prompt by replacing placeholders."""
     prompt = PROMPT_ADAPTER_V3
     prompt = prompt.replace("<<<RAW_TASK>>>", raw_task)
     prompt = prompt.replace("<<<CONTEXT>>>", context_block)
@@ -415,37 +360,33 @@ def _render_adapter_prompt(raw_task: str, context_block: str, mode_tag: str, tar
     prompt = prompt.replace("<<<OUTPUT_LANG>>>", output_lang)
     return prompt
 
-def _call_adapter(raw_task: str, context_block: str, mode_tag: str, output_pref: str) -> dict:
-    """Вызов PROMPT-ADAPTER для подготовки промпта"""
-    adapter_prompt = _render_adapter_prompt(raw_task, context_block, mode_tag, ADAPTER_TARGETS, ADAPTER_CONSTRAINTS, ADAPTER_TEST_POLICY, output_pref, ADAPTER_OUTPUT_LANG)
-    
+def _call_adapter_and_codegen(raw_task: str, context_block: str, mode_tag: str, output_pref: str) -> tuple[str, dict]:
+    adapter_prompt = _render_adapter_prompt(
+        raw_task, context_block, mode_tag, ADAPTER_TARGETS, ADAPTER_CONSTRAINTS,
+        ADAPTER_TEST_POLICY, output_pref, ADAPTER_OUTPUT_LANG
+    )
+    messages = [
+        {"role": "system", "content": "You are a code generation assistant using GPT-5. Follow the PROMPT-ADAPTER v3 rules to generate code based on the provided task and context."},
+        {"role": "user", "content": adapter_prompt}
+    ]
     try:
-        # Вызываем OpenAI API с GPT-5
-        response = _openai_create(ADAPTER_MODEL, adapter_prompt)
-        
-        # Извлекаем текст из ответа
-        if hasattr(response, 'choices') and response.choices:
-            text = response.choices[0].message.content
-        else:
+        response = _openai_create("gpt-5", messages)
+        if not hasattr(response, 'choices') or not response.choices:
             raise ValueError("Invalid response format from OpenAI")
-        
-        # Пытаемся распарсить JSON
+        text = response.choices[0].message.content
         try:
-            return json.loads(text)
+            adapter_obj = json.loads(text)
         except json.JSONDecodeError:
-            # Если JSON обернут в markdown блок кода
             code_block_match = re.search(r'```(?:json)?\n(.*?)\n```', text, re.DOTALL)
             if code_block_match:
-                return json.loads(code_block_match.group(1))
-            
-            # Последняя попытка - извлечь через extract_code
-            inner = extract_code(text)
-            return json.loads(inner)
-            
+                adapter_obj = json.loads(code_block_match.group(1))
+            else:
+                cleaned = extract_code(text)
+                adapter_obj = json.loads(cleaned)
+        return text, adapter_obj
     except Exception as e:
-        logger.error(f"Adapter call failed: {e}")
-        # Возвращаем минимальный валидный объект
-        return {
+        logger.error(f"Combined adapter/codegen call failed: {e}")
+        return "# Error generating code", {
             "messages": [
                 {"role": "system", "content": "Generate code based on user request using GPT-5"},
                 {"role": "user", "content": raw_task}
@@ -453,31 +394,7 @@ def _call_adapter(raw_task: str, context_block: str, mode_tag: str, output_pref:
             "response_contract": {"mode": output_pref}
         }
 
-def _call_codegen_from_messages(messages: list[dict]) -> str:
-    """Генерация кода на основе подготовленных сообщений"""
-    try:
-        # Нормализация ролей: developer -> system
-        norm = []
-        for m in messages:
-            role = m.get("role", "user")
-            if role == "developer":
-                role = "system"
-            norm.append({"role": role, "content": m.get("content", "")})
-        response = _openai_create(CODEGEN_MODEL, norm)
-        
-        # Извлекаем текст из ответа
-        if hasattr(response, 'choices') and response.choices:
-            text = response.choices[0].message.content
-            return text
-        else:
-            raise ValueError("Invalid response format from OpenAI")
-            
-    except Exception as e:
-        logger.error(f"Codegen call failed: {e}")
-        return "# Error generating code"
-
 def _apply_files_json(chat_id: int, active_filename: str, files_obj: list[dict]) -> Path:
-    """Применение FILES_JSON результата с безопасной обработкой путей"""
     active_written = None
     base_dir = chat_dir(chat_id)
     
@@ -488,29 +405,21 @@ def _apply_files_json(chat_id: int, active_filename: str, files_obj: list[dict])
         if not raw_path:
             continue
         
-        # Безопасная обработка пути
         safe_output_path = safe_path_join(base_dir, raw_path)
         if safe_output_path is None:
             logger.warning(f"Skipping unsafe path: {raw_path}")
             continue
         
         try:
-            # Создаем директории если нужно
             safe_output_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Записываем содержимое
             safe_output_path.write_text(content, encoding="utf-8")
             logger.info(f"Written file: {safe_output_path}")
-            
-            # Проверяем, является ли это активным файлом
             if Path(raw_path).name == active_filename:
                 active_written = version_current_file(chat_id, active_filename, content)
-                
         except Exception as e:
             logger.error(f"Failed to write file {raw_path}: {e}")
             continue
     
-    # Если активный файл не был записан, но есть файлы - используем первый
     if active_written is None and files_obj:
         first = files_obj[0]
         content = first.get("content", "")
@@ -519,7 +428,6 @@ def _apply_files_json(chat_id: int, active_filename: str, files_obj: list[dict])
     return active_written or latest_path(chat_id, active_filename)
 
 def _infer_output_pref(raw_text: str, has_context: bool) -> str:
-    """Определение предпочтительного формата вывода"""
     if has_context and (DIFF_BLOCK_RE.search(raw_text) or UNIFIED_DIFF_HINT_RE.search(raw_text) or GIT_DIFF_HINT_RE.search(raw_text)):
         return "UNIFIED_DIFF"
     return ADAPTER_OUTPUT_PREF
@@ -528,7 +436,6 @@ def _infer_output_pref(raw_text: str, has_context: bool) -> str:
 AUDIT_DB = OUTPUT_DIR / "audit.db"
 
 def _audit_connect():
-    """Подключение к БД аудита"""
     conn = sqlite3.connect(AUDIT_DB)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
@@ -548,13 +455,11 @@ def _audit_connect():
     return conn
 
 def _truncate(s: Optional[str], limit: int = 4000) -> Optional[str]:
-    """Обрезка строки до лимита"""
     if s is None: return None
     if len(s) <= limit: return s
     return s[:limit]
 
 def _file_meta(path: Optional[Path]) -> tuple[Optional[str], Optional[int]]:
-    """Метаданные файла (хеш и размер)"""
     if not path or not path.exists():
         return None, None
     b = path.stat().st_size
@@ -564,17 +469,18 @@ def _file_meta(path: Optional[Path]) -> tuple[Optional[str], Optional[int]]:
 def audit_event(chat_id: int, event_type: str, active_file: Optional[str] = None,
                 model: Optional[str] = None, prompt: Optional[str] = None,
                 output_path: Optional[Path] = None, meta: Optional[dict] = None):
-    """Запись события в аудит лог"""
     conn = _audit_connect()
     try:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         sha, size = _file_meta(output_path)
         conn.execute(
-            "INSERT INTO events (ts, chat_id, event_type, active_file, model, prompt, output_path, output_sha256, output_bytes, meta)"
+            "INSERT INTO events (ts, chat_id, event_type, event_type, active_file, model, prompt, output_path, output_sha256, output_bytes, meta)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (ts, chat_id, event_type, active_file, model, _truncate(prompt), str(output_path) if output_path else None, sha, size, json.dumps(meta or {}))
         )
         conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Failed to write audit event: {e}")
     finally:
         conn.close()
 
@@ -586,7 +492,7 @@ class InMsg(BaseModel):
 class GraphState(TypedDict, total=False):
     chat_id: int
     input_text: str
-    command: str               # CREATE | SWITCH | FILES | MODEL | RESET | GENERATE | DOWNLOAD
+    command: str
     arg: Optional[str]
     active_file: Optional[str]
     model: str
@@ -595,45 +501,36 @@ class GraphState(TypedDict, total=False):
 
 # ---------- ДЕКОРАТОР ДЛЯ БЕЗОПАСНОСТИ УЗЛОВ ----------
 def safe_node(func):
-    """Декоратор для безопасной обработки ошибок в узлах графа"""
     def wrapper(state: GraphState) -> GraphState:
         try:
             return func(state)
         except Exception as e:
             logger.error(f"Error in {func.__name__}: {e}", exc_info=True)
-            
-            # Формируем понятное сообщение об ошибке
             error_msg = f"❌ Ошибка в {func.__name__}: "
-            
-            if "api_key" in str(e).lower():
-                error_msg += "Проблема с API ключом OpenAI"
-            elif "rate" in str(e).lower():
+            if isinstance(e, APIError) and e.http_status == 429:
                 error_msg += "Превышен лимит запросов к API"
+            elif "api_key" in str(e).lower():
+                error_msg += "Проблема с API ключом OpenAI"
             elif "timeout" in str(e).lower():
                 error_msg += "Превышено время ожидания ответа"
             elif "json" in str(e).lower():
                 error_msg += "Ошибка парсинга ответа от AI"
             else:
                 error_msg += str(e)[:200]
-            
             state["reply_text"] = error_msg
             return state
-    
     wrapper.__name__ = func.__name__
     return wrapper
 
 # ---------- УЗЛЫ ГРАФА ----------
 def parse_message(state: GraphState) -> GraphState:
-    """Парсинг входящего сообщения для определения команды"""
     text = state["input_text"].strip()
     state["command"] = "GENERATE"
     state["arg"] = None
-    
     if text.startswith("/"):
         parts = text.split(maxsplit=1)
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else None
-        
         mapping = {
             "/create": "CREATE",
             "/switch": "SWITCH", 
@@ -644,12 +541,10 @@ def parse_message(state: GraphState) -> GraphState:
         }
         state["command"] = mapping.get(cmd, "GENERATE")
         state["arg"] = arg
-    
     return state
 
 @safe_node
 def node_create(state: GraphState) -> GraphState:
-    """Создание нового файла с безопасным именем"""
     chat_id = state["chat_id"]
     raw_filename = (state.get("arg") or "main.py").strip()
     filename = sanitize_filename(raw_filename)
@@ -664,7 +559,6 @@ def node_create(state: GraphState) -> GraphState:
 
 @safe_node
 def node_switch(state: GraphState) -> GraphState:
-    """Переключение на существующий файл"""
     chat_id = state["chat_id"]
     filename = (state.get("arg") or "").strip()
     if not filename:
@@ -681,7 +575,6 @@ def node_switch(state: GraphState) -> GraphState:
 
 @safe_node
 def node_files(state: GraphState) -> GraphState:
-    """Показать список файлов"""
     files = list_files(state["chat_id"])
     if not files:
         state["reply_text"] = "Файлов пока нет. Начни с /create app.py."
@@ -692,7 +585,6 @@ def node_files(state: GraphState) -> GraphState:
 
 @safe_node
 def node_model(state: GraphState) -> GraphState:
-    """Показать информацию о модели (только GPT-5)"""
     state["reply_text"] = (
         f"🧠 Используется модель: GPT-5\n\n"
         f"ℹ️ Это единственная поддерживаемая модель.\n"
@@ -703,7 +595,6 @@ def node_model(state: GraphState) -> GraphState:
 
 @safe_node
 def node_reset(state: GraphState) -> GraphState:
-    """Сброс состояния чата"""
     state["active_file"] = None
     state["model"] = DEFAULT_MODEL
     state["reply_text"] = "♻️ Сбросил состояние чата. Начни с /create <filename>."
@@ -712,29 +603,24 @@ def node_reset(state: GraphState) -> GraphState:
 
 @safe_node
 def node_generate(state: GraphState) -> GraphState:
-    """Генерация кода с помощью GPT-5"""
     chat_id = state["chat_id"]
     active = state.get("active_file")
     
-    # Автоматически создаем файл если его нет
     if not active:
         active = "main.py"
         ensure_latest_placeholder(chat_id, active, detect_language(active))
         state["active_file"] = active
         logger.info(f"Auto-created file: {active}")
 
-    # Всегда используем GPT-5
     model = "gpt-5"
     state["model"] = model
+    raw_user_text = state["input_text"][:10000]  # Cap input
+    state["reply_text"] = f"📥 Получен промпт: {raw_user_text[:100]}"  # Step 1: Prompt received
     
-    raw_user_text = state["input_text"]
-    
-    # Проверяем наличие текущего файла
     lp = latest_path(chat_id, active)
     existed_before = lp.exists()
     ensure_latest_placeholder(chat_id, active, detect_language(active))
-    current_text = lp.read_text(encoding="utf-8") if lp.exists() else ""
-
+    current_text = lp.read_text(encoding="utf-8")[:10000] if lp.exists() else ""
     language = detect_language(active)
     has_context = existed_before and not _is_placeholder_or_empty(current_text)
     context_block = _build_context_block(chat_id, active) if has_context else ""
@@ -744,88 +630,70 @@ def node_generate(state: GraphState) -> GraphState:
     logger.info(f"Generating for {active} with GPT-5, mode {mode_tag}")
 
     try:
-        # Шаг 1: PROMPT-ADAPTER
-        adapter_obj = _call_adapter(raw_user_text, context_block, mode_tag, output_pref)
-        messages = adapter_obj.get("messages") or []
-        
-        if not messages:
-            raise ValueError("Adapter returned empty messages")
+        # Step 2: Form universal prompt and show it
+        codegen_text, adapter_obj = _call_adapter_and_codegen(raw_user_text, context_block, mode_tag, output_pref)
+        user_message = (adapter_obj.get("messages") or [{}])[-1].get("content", "No user message")
+        state["reply_text"] += f"\n📝 Сформирован универсальный промпт:\nИсходный: {raw_user_text[:100]}\nАдаптированный:\n```{user_message[:200]}```"
 
-        # Шаг 2: Codegen с GPT-5
-        codegen_text = _call_codegen_from_messages(messages)
-        
+        # Step 3: API call sent and response received
+        state["reply_text"] += f"\n🚀 Отправлен запрос в API GPT-5, ответ получен"
+
         if not codegen_text or codegen_text == "# Error generating code":
             raise ValueError("Failed to generate code")
 
-        # Применение результата
+        # Step 4: Process response for code generation
+        state["reply_text"] += f"\n🔍 Получен готовый промпт, обработка для генерации кода:\n```{codegen_text[:100]}```"
+        
         mode = (adapter_obj.get("response_contract") or {}).get("mode", output_pref)
         updated_path = None
 
-        if (mode or "").upper() == "FILES_JSON":
+        if mode.upper() == "FILES_JSON":
             try:
                 obj = json.loads(codegen_text)
             except json.JSONDecodeError:
                 obj = json.loads(extract_code(codegen_text))
-            
             files = obj.get("files") or []
             if not files:
                 raise ValueError("No files in response")
-                
             updated_path = _apply_files_json(chat_id, active, files)
-
-        elif (mode or "").upper() == "UNIFIED_DIFF":
-            # Пока используем fallback на полный файл
+        elif mode.upper() == "UNIFIED_DIFF":
             logger.info("UNIFIED_DIFF mode - using full file replacement")
             code = extract_code(codegen_text)
             updated_path = version_current_file(chat_id, active, code)
-
         else:
-            # Режим по умолчанию - простой код
             code = extract_code(codegen_text)
             updated_path = version_current_file(chat_id, active, code)
 
-        # Формируем ответ БЕЗ обратных кавычек
         rel = latest_path(chat_id, active).relative_to(OUTPUT_DIR)
-        state["reply_text"] = (
-            f"✅ Обновил {active} через PROMPT-ADAPTER v3\n"
+        state["reply_text"] += (
+            f"\n✅ Обновил {active} через PROMPT-ADAPTER v3\n"
             f"🧠 Модель: GPT-5\n"
-            f"📁 Контракт: {(mode or output_pref)}\n"
+            f"📁 Контракт: {mode}\n"
             f"💾 Сохранено: {rel}\n\n"
             f"Отправь следующий промпт или используй команды."
         )
         
-        # Аудит успешной генерации
         audit_event(
             chat_id, "GENERATE",
             active_file=active, 
             model="gpt-5",
-            prompt=json.dumps(adapter_obj, ensure_ascii=False)[:4000],
+            prompt=raw_user_text[:4000],
             output_path=updated_path,
-            meta={
-                "adapter_mode": mode_tag, 
-                "contract_mode": mode or output_pref,
-                "success": True
-            }
+            meta={"adapter_mode": mode_tag, "contract_mode": mode, "success": True}
         )
-        
     except Exception as e:
         logger.error(f"Generation failed: {e}", exc_info=True)
-        
-        # Аудит неудачной генерации
         audit_event(
             chat_id, "GENERATE_ERROR",
             active_file=active,
             model="gpt-5",
             meta={"error": str(e)[:500]}
         )
-        
-        # Перебрасываем для обработки декоратором
         raise
 
     return state
 
 def _make_zip(chat_id: int, selector: Optional[str] = None) -> Path:
-    """Создание ZIP-архива файлов чата."""
     base = chat_dir(chat_id)
     ts = time.strftime("%Y%m%d_%H%M%S")
     zip_path = OUTPUT_DIR / f"chat_{chat_id}_{ts}.zip"
@@ -847,7 +715,6 @@ def _make_zip(chat_id: int, selector: Optional[str] = None) -> Path:
 
 @safe_node
 def node_download(state: GraphState) -> GraphState:
-    """Создание архива для скачивания"""
     chat_id = state["chat_id"]
     arg = state.get("arg")
     
@@ -865,16 +732,10 @@ def node_download(state: GraphState) -> GraphState:
 
 # ---------- РОУТЕР И СБОРКА ПРИЛОЖЕНИЯ ----------
 def router(state: GraphState) -> str:
-    """Роутер для определения следующего узла"""
     return state["command"]
 
-# Замените функцию build_app() в graph_app.py на эту исправленную версию:
-
 def build_app():
-    """Сборка LangGraph приложения с checkpointer"""
     sg = StateGraph(GraphState)
-    
-    # Добавляем узлы
     sg.add_node("parse", parse_message)
     sg.add_node("CREATE", node_create)
     sg.add_node("SWITCH", node_switch)
@@ -883,11 +744,7 @@ def build_app():
     sg.add_node("RESET", node_reset)
     sg.add_node("GENERATE", node_generate)
     sg.add_node("DOWNLOAD", node_download)
-
-    # Устанавливаем точку входа
     sg.set_entry_point("parse")
-    
-    # Добавляем условные переходы от парсера к узлам
     sg.add_conditional_edges("parse", router, {
         "CREATE": "CREATE",
         "SWITCH": "SWITCH",
@@ -897,102 +754,16 @@ def build_app():
         "GENERATE": "GENERATE",
         "DOWNLOAD": "DOWNLOAD",
     })
-    
-    # Все узлы ведут к концу
     for node in ("CREATE", "SWITCH", "FILES", "MODEL", "RESET", "GENERATE", "DOWNLOAD"):
         sg.add_edge(node, END)
-
-    # Настройка checkpointer
-    checkpointer = None
-    
-    if _CHECKPOINTER_KIND == "sqlite":
-        try:
-            from langgraph.checkpoint.sqlite import SqliteSaver
-            import sqlite3
-            
-            db_path = OUTPUT_DIR / "langgraph.db"
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # ВАЖНО: SqliteSaver требует connection, а не строку пути
-            # Создаем connection объект
-            conn = sqlite3.connect(str(db_path), check_same_thread=False)
-            
-            # Создаем SqliteSaver с connection объектом
-            checkpointer = SqliteSaver(conn)
-            
-            logger.info(f"Using SQLite checkpointer with connection at {db_path}")
-            
-        except ImportError as e:
-            logger.warning(f"SqliteSaver not available: {e}, falling back to MemorySaver")
-            from langgraph.checkpoint.memory import MemorySaver
-            checkpointer = MemorySaver()
-        except Exception as e:
-            logger.error(f"Failed to create SQLite checkpointer: {e}, falling back to MemorySaver")
-            from langgraph.checkpoint.memory import MemorySaver
-            checkpointer = MemorySaver()
-    
-    if checkpointer is None:
-        from langgraph.checkpoint.memory import MemorySaver
-        checkpointer = MemorySaver()
-        logger.info("Using MemorySaver (non-persistent)")
-
-    # Компилируем граф с checkpointer
+    checkpointer = MemorySaver()
+    logger.info("Using MemorySaver (non-persistent)")
     compiled_app = sg.compile(checkpointer=checkpointer)
-    
     logger.info("LangGraph application compiled successfully")
     return compiled_app
 
-# ---------- АЛЬТЕРНАТИВНЫЙ ВАРИАНТ (если первый не работает) ----------
-
-def build_app_alternative():
-    """Альтернативная версия с упрощенным checkpointer"""
-    sg = StateGraph(GraphState)
-    
-    # Добавляем узлы
-    sg.add_node("parse", parse_message)
-    sg.add_node("CREATE", node_create)
-    sg.add_node("SWITCH", node_switch)
-    sg.add_node("FILES", node_files)
-    sg.add_node("MODEL", node_model)
-    sg.add_node("RESET", node_reset)
-    sg.add_node("GENERATE", node_generate)
-    sg.add_node("DOWNLOAD", node_download)
-
-    # Устанавливаем точку входа
-    sg.set_entry_point("parse")
-    
-    # Добавляем условные переходы
-    sg.add_conditional_edges("parse", router, {
-        "CREATE": "CREATE",
-        "SWITCH": "SWITCH",
-        "FILES": "FILES",
-        "MODEL": "MODEL",
-        "RESET": "RESET",
-        "GENERATE": "GENERATE",
-        "DOWNLOAD": "DOWNLOAD",
-    })
-    
-    # Все узлы ведут к концу
-    for node in ("CREATE", "SWITCH", "FILES", "MODEL", "RESET", "GENERATE", "DOWNLOAD"):
-        sg.add_edge(node, END)
-
-    # Используем только MemorySaver для избежания проблем с SQLite
-    from langgraph.checkpoint.memory import MemorySaver
-    checkpointer = MemorySaver()
-    logger.info("Using MemorySaver for state management")
-
-    # Компилируем граф
-    compiled_app = sg.compile(checkpointer=checkpointer)
-    
-    return compiled_app
-
-# В конце файла используйте:
-# APP = build_app_alternative()  # Если основная версия не работает
-
 # ---------- ИНИЦИАЛИЗАЦИЯ ----------
 APP = build_app()
-
-# Экспорт для bot.py
 __all__ = ['APP', 'DEFAULT_MODEL', 'VALID_MODELS']
-
 logger.info(f"Graph app initialized. Model: GPT-5 only. Output dir: {OUTPUT_DIR}")
+```
