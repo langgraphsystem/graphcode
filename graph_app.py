@@ -256,11 +256,12 @@ def _openai_create(model: str, input_payload):
         raise
 
 # ---------- PROMPT-ADAPTER V3 ШАБЛОН ----------
-PROMPT_ADAPTER_V3 = r"""[PROMPT-ADAPTER v3 — EN-adapt, API-ready for GPT-5]
+PROMPT_ADAPTER_V3 = r"""[PROMPT-ADAPTER v3 — EN-adapt, API-ready]
+
 [STATIC RULES — cacheable]
 You are a PromptAdapter for code generation via OpenAI API (GPT-5). Your job: take RAW_TASK (any language) + CONTEXT and return an API-ready package with:
 - clean English developer instructions,
-- user message containing both original content and an English adaptation,
+- user message containing both original content and an English adaptation of the *instructions/specs only*,
 - a strict response contract (FILES_JSON | UNIFIED_DIFF | TOOLS_CALLS).
 
 Principles:
@@ -270,12 +271,12 @@ Principles:
 4) Short plan (3–6 steps), no chain-of-thought.
 5) If inputs are incomplete, state careful assumptions explicitly.
 6) For multi-file changes use TOOLS_CALLS with atomic tool calls.
-7) Limit "verbal text" to ≤200 lines outside code/DIFF.
+7) Limit “verbal text” to ≤200 lines outside code/DIFF (code/DIFF not limited, but keep within model output limits).
 
-**English Adaptation Policy:**
-- Translate instructions/specs/requirements to English concisely.
-- DO NOT translate: code blocks, stack traces, file paths, API names, JSON/YAML, diffs, UI strings, domain terms.
-- Keep user-facing strings in OUTPUT_LANG if specified.
+**English Adaptation Policy (very important):**
+- Translate *instructions/specs/requirements* to English concisely.
+- DO NOT translate or alter: code blocks, stack traces, file paths, API names, JSON/YAML/TOML, unified diffs, quoted UI strings, or domain terms when translation could change semantics.
+- If OUTPUT_LANG is specified (e.g., RU for UI text), keep user-facing strings in that language; keep identifiers/comments as requested.
 
 [OUTPUT SCHEMA — return ONE JSON object]
 {
@@ -304,10 +305,38 @@ Principles:
       },
       "required":["files"],
       "additionalProperties":false
-    }
+    },
+    "tools":[
+      {
+        "name":"apply_patch",
+        "description":"Apply a unified diff to a file",
+        "parameters":{
+          "type":"object",
+          "properties":{
+            "file_path":{"type":"string"},
+            "patch":{"type":"string"}
+          },
+          "required":["file_path","patch"],
+          "additionalProperties":false
+        }
+      },
+      {
+        "name":"write_file",
+        "description":"Write or overwrite a file",
+        "parameters":{
+          "type":"object",
+          "properties":{
+            "path":{"type":"string"},
+            "content":{"type":"string"}
+          },
+          "required":["path","content"],
+          "additionalProperties":false
+        }
+      }
+    ]
   },
   "runbook":{
-    "plan":["step 1","step 2","step 3"],
+    "plan":["step 1","step 2","step 3"],           // brief, no CoT
     "commands":["<install/build/test cmds>"],
     "tests_hint":"what to cover if TEST_POLICY=TDD"
   },
@@ -316,22 +345,52 @@ Principles:
   "notes":"short CI/CD hints"
 }
 
-[DYNAMIC INPUT]
+[HOW TO FILL]
+1) messages.developer (EN): set strict code rules—language/version, style, formatter/linter, security/perf constraints, error/log policy, and the exact output format per response_contract.mode. 
+2) messages.user: pack inputs with clear delimiters, include bilingual content:
+   - RAW (original, any language)
+   - EN_ADAPT (concise English adaptation of *instructions/specs only*)
+   Use delimiters:
+     <<<RAW_TASK>>>
+     …original text…
+     <<<END>>>
+     <<<EN_ADAPT>>>
+     …English adaptation of requirements/specs…
+     <<<END>>>
+     <<<CONTEXT:FILE path/to/file.ext>>>
+     …code/logs (do NOT translate)…
+     <<<END>>>
+     <<<LOGS>>>
+     …stack traces (do NOT translate)…
+     <<<END>>>
+     <<<SPEC>>>
+     …requirements; translate to English inside EN_ADAPT above…
+     <<<END>>>
+3) response_contract.mode:
+   - FILES_JSON — for new files/large rewrites (return {files:[{path,content}],notes}).
+   - UNIFIED_DIFF — for minimal patches (return a valid unified diff only).
+   - TOOLS_CALLS — for multi-file edits; the model must call tools.
+4) runbook: 3–6 steps for build/run/test, brief.
+5) assumptions/risks: explicit and minimal.
+
+[STYLE]
+- Developer message: English.
+- User message: includes RAW + EN_ADAPT.
+- Keep non-code prose concise (≤200 lines).
+- No internal reasoning; only final results and a short plan.
+
+[DYNAMIC INPUT — fill at call-time]
 RAW_TASK: <<<RAW_TASK>>>
-{RAW_TASK}
-<<<END>>>
-CONTEXT: <<<CONTEXT>>>
-{CONTEXT}
-<<<END>>>
-MODE: {MODE}
-TARGETS: {TARGETS}
-CONSTRAINTS: {CONSTRAINTS}
-TEST_POLICY: {TEST_POLICY}
-OUTPUT_PREF: {OUTPUT_PREF}
-OUTPUT_LANG: {OUTPUT_LANG}
+CONTEXT (optional): <<<CONTEXT>>>
+MODE: <<<MODE>>>                          // NEW_FILE | DIFF_PATCH | MULTIFILE_TOOLS
+TARGETS: <<<TARGETS>>>                    // lang versions/linters/deps
+CONSTRAINTS: <<<CONSTRAINTS>>>            // perf/security/licenses
+TEST_POLICY: <<<TEST_POLICY>>>            // TDD | NO_TESTS
+OUTPUT_PREF: <<<OUTPUT_PREF>>>            // FILES_JSON | UNIFIED_DIFF | TOOLS_CALLS
+OUTPUT_LANG: <<<OUTPUT_LANG>>>            // e.g., RU for UI strings
 
 [NOW DO]
-Construct and return ONE JSON object strictly matching OUTPUT SCHEMA.
+Construct and return ONE JSON object strictly matching OUTPUT SCHEMA, with developer in English and user containing both RAW and EN_ADAPT, following the English Adaptation Policy.
 """
 
 def _build_context_block(chat_id: int, filename: str) -> str:
@@ -345,9 +404,7 @@ def _build_context_block(chat_id: int, filename: str) -> str:
 
 def _call_adapter(raw_task: str, context_block: str, mode_tag: str, output_pref: str) -> dict:
     """Вызов PROMPT-ADAPTER для подготовки промпта"""
-    adapter_prompt = PROMPT_ADAPTER_V3.format(
-        RAW_TASK=raw_task,
-        CONTEXT=context_block or "(none)",
+    adapter_prompt = _render_adapter_prompt(raw_task, context_block, mode_tag, output_pref)",
         MODE=mode_tag,
         TARGETS=ADAPTER_TARGETS,
         CONSTRAINTS=ADAPTER_CONSTRAINTS,
@@ -393,7 +450,14 @@ def _call_adapter(raw_task: str, context_block: str, mode_tag: str, output_pref:
 def _call_codegen_from_messages(messages: list[dict]) -> str:
     """Генерация кода на основе подготовленных сообщений"""
     try:
-        response = _openai_create(CODEGEN_MODEL, messages)
+        # Нормализация ролей: developer -> system
+norm = []
+for m in messages:
+    role = m.get("role", "user")
+    if role == "developer":
+        role = "system"
+    norm.append({"role": role, "content": m.get("content", "")})
+response = _openai_create(CODEGEN_MODEL, norm)
         
         # Извлекаем текст из ответа
         if hasattr(response, 'choices') and response.choices:
