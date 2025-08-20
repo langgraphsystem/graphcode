@@ -1,21 +1,28 @@
+# База (pip/setuptools/wheel обновятся сами при установке)
 pip>=24.2
 setuptools>=70.0.0
 wheel>=0.44.0
 
-python-telegram-bot==20.7
-openai>=1.43.0
+# LLM SDKs
+openai>=1.43.0,<2            # совместимо с Responses API
+anthropic>=0.64.0,<1          # при наличии ключа; не обязателен
 
-# Anthropic Python SDK (самая свежая)
-anthropic>=0.64.0
+# Оркестрация/агентки
+langgraph>=0.2.39,<0.3
+langchain>=0.2.16,<0.3
+langgraph-checkpoint-sqlite>=2.0.0,<3.0  # если захочешь sqlite-чекпойнтер вместо MemorySaver
 
-# LangGraph + совместимые версии
-langgraph>=0.2.39
-langchain>=0.2.16
+# Телеграм-бот (если используешь)
+python-telegram-bot==20.7     # py>=3.8; совместим с 3.11
 
-# ВАЖНО: отдельный пакет с SQLite-чекпойнтером
-langgraph-checkpoint-sqlite>=2.0.0
+# Вспомогательные
+python-dotenv>=1.0.1,<2
+pydantic>=2.7.1,<3
+tenacity>=8.2.3,<9
 
-python-dotenv>=1.0.1
-pydantic>=2.7.1
-tenacity>=8.2.3
+# Опционально, но полезно
+uvloop>=0.19.0; sys_platform != "win32"   # ускорение asyncio (Linux/macOS)
+typing-extensions>=4.12.2                  # если вдруг запустится на py<3.11
+
+
 
