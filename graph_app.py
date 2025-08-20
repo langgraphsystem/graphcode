@@ -816,6 +816,8 @@ def router(state: GraphState) -> str:
     """Роутер для определения следующего узла"""
     return state["command"]
 
+# Замените функцию build_app() в graph_app.py на эту исправленную версию:
+
 def build_app():
     """Сборка LangGraph приложения с checkpointer"""
     sg = StateGraph(GraphState)
@@ -849,23 +851,35 @@ def build_app():
         sg.add_edge(node, END)
 
     # Настройка checkpointer
+    checkpointer = None
+    
     if _CHECKPOINTER_KIND == "sqlite":
         try:
             from langgraph.checkpoint.sqlite import SqliteSaver
+            import sqlite3
             
             db_path = OUTPUT_DIR / "langgraph.db"
             db_path.parent.mkdir(parents=True, exist_ok=True)
             
-            # Создаем checkpointer с SQLite
-            checkpointer = SqliteSaver(str(db_path))
+            # ВАЖНО: SqliteSaver требует connection, а не строку пути
+            # Создаем connection объект
+            conn = sqlite3.connect(str(db_path), check_same_thread=False)
             
-            logger.info(f"Using SQLite checkpointer at {db_path}")
+            # Создаем SqliteSaver с connection объектом
+            checkpointer = SqliteSaver(conn)
             
-        except Exception as e:
-            logger.warning(f"Failed to create SQLite checkpointer: {e}, falling back to MemorySaver")
+            logger.info(f"Using SQLite checkpointer with connection at {db_path}")
+            
+        except ImportError as e:
+            logger.warning(f"SqliteSaver not available: {e}, falling back to MemorySaver")
             from langgraph.checkpoint.memory import MemorySaver
             checkpointer = MemorySaver()
-    else:
+        except Exception as e:
+            logger.error(f"Failed to create SQLite checkpointer: {e}, falling back to MemorySaver")
+            from langgraph.checkpoint.memory import MemorySaver
+            checkpointer = MemorySaver()
+    
+    if checkpointer is None:
         from langgraph.checkpoint.memory import MemorySaver
         checkpointer = MemorySaver()
         logger.info("Using MemorySaver (non-persistent)")
@@ -873,8 +887,55 @@ def build_app():
     # Компилируем граф с checkpointer
     compiled_app = sg.compile(checkpointer=checkpointer)
     
-    logger.info("LangGraph application compiled successfully with GPT-5 support")
+    logger.info("LangGraph application compiled successfully")
     return compiled_app
+
+# ---------- АЛЬТЕРНАТИВНЫЙ ВАРИАНТ (если первый не работает) ----------
+
+def build_app_alternative():
+    """Альтернативная версия с упрощенным checkpointer"""
+    sg = StateGraph(GraphState)
+    
+    # Добавляем узлы
+    sg.add_node("parse", parse_message)
+    sg.add_node("CREATE", node_create)
+    sg.add_node("SWITCH", node_switch)
+    sg.add_node("FILES", node_files)
+    sg.add_node("MODEL", node_model)
+    sg.add_node("RESET", node_reset)
+    sg.add_node("GENERATE", node_generate)
+    sg.add_node("DOWNLOAD", node_download)
+
+    # Устанавливаем точку входа
+    sg.set_entry_point("parse")
+    
+    # Добавляем условные переходы
+    sg.add_conditional_edges("parse", router, {
+        "CREATE": "CREATE",
+        "SWITCH": "SWITCH",
+        "FILES": "FILES",
+        "MODEL": "MODEL",
+        "RESET": "RESET",
+        "GENERATE": "GENERATE",
+        "DOWNLOAD": "DOWNLOAD",
+    })
+    
+    # Все узлы ведут к концу
+    for node in ("CREATE", "SWITCH", "FILES", "MODEL", "RESET", "GENERATE", "DOWNLOAD"):
+        sg.add_edge(node, END)
+
+    # Используем только MemorySaver для избежания проблем с SQLite
+    from langgraph.checkpoint.memory import MemorySaver
+    checkpointer = MemorySaver()
+    logger.info("Using MemorySaver for state management")
+
+    # Компилируем граф
+    compiled_app = sg.compile(checkpointer=checkpointer)
+    
+    return compiled_app
+
+# В конце файла используйте:
+# APP = build_app_alternative()  # Если основная версия не работает
 
 # ---------- ИНИЦИАЛИЗАЦИЯ ----------
 APP = build_app()
@@ -883,3 +944,4 @@ APP = build_app()
 __all__ = ['APP', 'DEFAULT_MODEL', 'VALID_MODELS']
 
 logger.info(f"Graph app initialized. Model: GPT-5 only. Output dir: {OUTPUT_DIR}")
+
