@@ -8,6 +8,9 @@ openai>=1.43.0
 langgraph>=0.2.39
 langchain>=0.2.16
 
+# ВАЖНО: отдельный пакет с чекпойнтером SQLite
+langgraph-checkpoint-sqlite>=0.1.0
+
 python-dotenv>=1.0.1
 pydantic>=2.7.1
 tenacity>=8.2.3
