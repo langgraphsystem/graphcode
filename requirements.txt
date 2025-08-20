@@ -5,6 +5,9 @@ wheel>=0.44.0
 python-telegram-bot==20.7
 openai>=1.43.0
 
+# Anthropic Python SDK (самая свежая)
+anthropic>=0.64.0
+
 # LangGraph + совместимые версии
 langgraph>=0.2.39
 langchain>=0.2.16
@@ -15,3 +18,4 @@ langgraph-checkpoint-sqlite>=2.0.0
 python-dotenv>=1.0.1
 pydantic>=2.7.1
 tenacity>=8.2.3
+
