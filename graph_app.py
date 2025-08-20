@@ -6,13 +6,19 @@ from typing import TypedDict, Optional, Iterable
 
 from langgraph.graph import StateGraph, END
 
-# Чекпойнтер: сначала пробуем SQLite, если недоступен — используем MemorySaver
-try:
-    from langgraph.checkpoint.sqlite import SqliteSaver
-    _CHECKPOINTER_KIND = "sqlite"
-except Exception:
-    from langgraph.checkpoint.memory import MemorySaver
-    _CHECKPOINTER_KIND = "memory"
+# Чекпойнтер: используем только MemorySaver для избежания проблем с SQLite
+from langgraph.checkpoint.memory import MemorySaver
+_CHECKPOINTER_KIND = "memory"
+
+# Если хотите попробовать SQLite (может вызывать ошибки):
+# try:
+#     from langgraph.checkpoint.sqlite import SqliteSaver
+#     import sqlite3
+#     _CHECKPOINTER_KIND = "sqlite"
+# except Exception as e:
+#     print(f"SQLite checkpointer not available: {e}")
+#     from langgraph.checkpoint.memory import MemorySaver
+#     _CHECKPOINTER_KIND = "memory"
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from pydantic import BaseModel
@@ -944,4 +950,5 @@ APP = build_app()
 __all__ = ['APP', 'DEFAULT_MODEL', 'VALID_MODELS']
 
 logger.info(f"Graph app initialized. Model: GPT-5 only. Output dir: {OUTPUT_DIR}")
+
 
