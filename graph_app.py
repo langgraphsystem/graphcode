@@ -435,6 +435,9 @@ def entry_point(state: GraphState) -> GraphState:
     else:
         state["command"] = Command.GENERATE
     
+    # Initialize status messages for the new request
+    state["status_msgs"] = []
+    
     state["db"] = sqlite3.connect(config.output_dir / "audit.db")
     state["db"].execute("""
         CREATE TABLE IF NOT EXISTS events (
@@ -509,11 +512,13 @@ def node_run(state: GraphState) -> GraphState:
     active_file = state.get("active_file", "main.py")
     model = state.get("codegen_model", config.codegen_model_default)
     mode = state.get("pending_mode", config.adapter_output_pref.value)
-    push_status(state, f"▶️ Running codegen with {model}")
+    push_status(state, f"▶️ Запускаю кодогенератор с моделью: {model}") # <-- НОВОЕ СООБЩЕНИЕ
 
     codegen_text = call_codegen(messages, mode=mode, model=model)
     if codegen_text.startswith("# Error"):
         raise ValueError(codegen_text)
+    
+    push_status(state, "✔️ Модель-кодогенератор успешно ответила.") # <-- НОВОЕ СООБЩЕНИЕ
 
     if mode == "FILES_JSON":
         files_obj = json.loads(extract_code(codegen_text)).get("files", [])
@@ -521,13 +526,15 @@ def node_run(state: GraphState) -> GraphState:
     else: # CODE_ONLY or UNIFIED_DIFF (treated as full replacement)
         updated_path = version_current_file(chat_id, active_file, extract_code(codegen_text))
     
+    push_status(state, f"✔️ Код успешно применен к файлу: {updated_path.name}") # <-- НОВОЕ СООБЩЕНИЕ
+    
     rel_path = updated_path.relative_to(config.output_dir)
     status_block = "\n".join(f"{i+1}. {line}" for i, line in enumerate(state.get("status_msgs", [])))
     state["reply_text"] = (
-        f"🧭 Status:\n{status_block}\n\n"
-        f"✅ Updated {active_file}\n"
-        f"🧩 Codegen: {model}\n"
-        f"💾 Saved: {rel_path}"
+        f"🧭 **Статус выполнения:**\n{status_block}\n\n"
+        f"✅ **Готово!** Файл `{active_file}` обновлен.\n"
+        f"🧩 **Кодогенератор:** `{model}`\n"
+        f"💾 **Сохранено:** `{rel_path}`"
     )
     audit_event(state["db"], chat_id, "GENERATE_SUCCESS", model=model, output_path=str(updated_path))
     
@@ -554,27 +561,34 @@ def node_generate(state: GraphState) -> GraphState:
         state = node_create_switch(state) # Create default file
         active_file = state["active_file"]
     
-    push_status(state, f"📩 User request received ({len(state['input_text'])} chars)")
+    push_status(state, f"📩 Получен запрос от пользователя ({len(state['input_text'])} симв.)")
     
     context_block = build_context_block(chat_id, active_file)
     mode_tag = "DIFF_PATCH" if context_block else "NEW_FILE"
-    push_status(state, f"🧠 Calling adapter (mode={mode_tag})")
+    push_status(state, f"🧠 Вызываю модель-адаптер (режим: {mode_tag})")
     
     adapter_prompt = render_adapter_prompt(state["input_text"], context_block, mode_tag)
     adapter_result = call_adapter(adapter_prompt)
+    
+    # Check if adapter call was successful before proceeding
+    if not adapter_result.get("messages"):
+        state["reply_text"] = "❌ Ошибка: Модель-адаптер не смогла обработать запрос. Попробуйте переформулировать."
+        return state
+
+    push_status(state, "✔️ Модель-адаптер успешно ответила.") # <-- НОВОЕ СООБЩЕНИЕ
     
     state["pending_messages"] = adapter_result["messages"]
     state["pending_mode"] = adapter_result["response_contract"]["mode"]
     
     audit_event(state["db"], chat_id, "ADAPTER_READY", model=config.adapter_model)
-    push_status(state, "✅ Structured prompt ready.")
+    push_status(state, "✅ Структурированный промпт готов к работе.")
     
     status_block = "\n".join(f"{i+1}. {line}" for i, line in enumerate(state.get("status_msgs", [])))
     state["reply_text"] = (
-        f"🧭 Status:\n{status_block}\n\n"
-        "Choose LLM for codegen:\n"
-        f"→ /llm <{'|'.join(sorted(VALID_CODEGEN_MODELS))}>\n"
-        f"→ /run (use current: {state.get('codegen_model', config.codegen_model_default)})"
+        f"🧭 **Статус подготовки:**\n{status_block}\n\n"
+        "**Выберите LLM для генерации кода:**\n"
+        f"→ `/llm <{'|'.join(sorted(VALID_CODEGEN_MODELS))}>`\n"
+        f"→ `/run` (использовать текущую: `{state.get('codegen_model', config.codegen_model_default)}`)"
     )
     return state
 
