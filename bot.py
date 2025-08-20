@@ -177,8 +177,7 @@ async def check_authorization(update: Update) -> bool:
 # =========================
 # Helpers
 # =========================
-@@
- async def invoke_graph_with_retry(
+async def invoke_graph_with_retry(
      chat_id: int, 
      text: str,
      max_retries: int = 3
@@ -205,8 +204,7 @@ async def check_authorization(update: Update) -> bool:
 +                lambda: APP.invoke(state, config=cfg)
              )
              return result or {}
-@@
- def detect_llm_choice_needed(reply: str) -> bool:
+def detect_llm_choice_needed(reply: str) -> bool:
      """Check if response indicates LLM choice is needed."""
 -    markers = [
 -        "Structured prompt ready",
@@ -668,5 +666,6 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
         sys.exit(1)
+
 
 
