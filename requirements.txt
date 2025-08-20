@@ -5,10 +5,11 @@ wheel>=0.44.0
 python-telegram-bot==20.7
 openai>=1.43.0
 
+# LangGraph + совместимые версии
 langgraph>=0.2.39
 langchain>=0.2.16
 
-# ВАЖНО: отдельный пакет с чекпойнтером SQLite
+# ВАЖНО: отдельный пакет чекпойнтера SQLite (иначе импорта не будет)
 langgraph-checkpoint-sqlite>=0.1.0
 
 python-dotenv>=1.0.1
