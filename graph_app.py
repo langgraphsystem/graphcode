@@ -5,7 +5,16 @@ from pathlib import Path
 from typing import TypedDict, Optional, Iterable
 
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.sqlite import SqliteSaver
+
+# Чекпойнтер: сначала пробуем SQLite (требует отдельный пакет),
+# если модуль недоступен — используем MemorySaver (без персистентности).
+try:
+    from langgraph.checkpoint.sqlite import SqliteSaver  # из langgraph-checkpoint-sqlite
+    _CHECKPOINTER_KIND = "sqlite"
+except Exception:
+    from langgraph.checkpoint.memory import MemorySaver
+    _CHECKPOINTER_KIND = "memory"
+
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from pydantic import BaseModel
 from openai import OpenAI
@@ -16,16 +25,15 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5")
 REQUEST_TIMEOUT = int(os.getenv("OPENAI_REQUEST_TIMEOUT", "300"))
 
-# Параметры адаптера (можно переопределить в переменных окружения)
-ADAPTER_MODEL = os.getenv("ADAPTER_MODEL", DEFAULT_MODEL)  # модель для шага 1 (Adapter)
-CODEGEN_MODEL = os.getenv("CODEGEN_MODEL", DEFAULT_MODEL)  # модель для шага 2 (Codegen)
+# Параметры PROMPT-ADAPTER (можно переопределять в Railway Variables)
+ADAPTER_MODEL = os.getenv("ADAPTER_MODEL", DEFAULT_MODEL)
+CODEGEN_MODEL = os.getenv("CODEGEN_MODEL", DEFAULT_MODEL)
 ADAPTER_TARGETS = os.getenv("ADAPTER_TARGETS", "Python 3.11; Ruff+Black; Pydantic v2; asyncio; type hints strict")
-ADAPTER_CONSTRAINTS = os.getenv("ADAPTER_CONSTRAINTS", "No secrets in code; perf O(n) where possible; no heavyweight deps")
-ADAPTER_TEST_POLICY = os.getenv("ADAPTER_TEST_POLICY", "NO_TESTS")  # или TDD
-ADAPTER_OUTPUT_LANG = os.getenv("ADAPTER_OUTPUT_LANG", "EN")        # UI строки, если нужно: RU/EN/...
-ADAPTER_OUTPUT_PREF = os.getenv("ADAPTER_OUTPUT_PREF", "FILES_JSON") # FILES_JSON | UNIFIED_DIFF | TOOLS_CALLS
+ADAPTER_CONSTRAINTS = os.getenv("ADAPTER_CONSTRAINTS", "No secrets; reasonable perf; minimal deps")
+ADAPTER_TEST_POLICY = os.getenv("ADAPTER_TEST_POLICY", "NO_TESTS")
+ADAPTER_OUTPUT_LANG = os.getenv("ADAPTER_OUTPUT_LANG", "EN")
+ADAPTER_OUTPUT_PREF = os.getenv("ADAPTER_OUTPUT_PREF", "FILES_JSON")  # FILES_JSON | UNIFIED_DIFF | TOOLS_CALLS
 
-# Клиент OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ УТИЛИТЫ ----------
@@ -69,8 +77,7 @@ def ensure_latest_placeholder(chat_id: int, filename: str, language: str) -> Pat
 
 def list_files(chat_id: int) -> list[str]:
     base = chat_dir(chat_id)
-    files = sorted([p.name for p in base.iterdir() if p.is_file()])
-    return files
+    return sorted([p.name for p in base.iterdir() if p.is_file()])
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -82,7 +89,7 @@ def version_current_file(chat_id: int, filename: str, new_content: str) -> Path:
     lp = latest_path(chat_id, filename)
     old = lp.read_text(encoding="utf-8") if lp.exists() else ""
     if hashlib.sha256(old.encode()).hexdigest() == hashlib.sha256(new_content.encode()).hexdigest():
-        return lp  # без изменений
+        return lp
     ts = time.strftime("%Y%m%d-%H%M%S")
     ver = chat_dir(chat_id) / f"{ts}-{filename}"
     ver.write_text(new_content, encoding="utf-8")
@@ -102,31 +109,23 @@ def extract_code(text: str) -> str:
     return m.group(2).strip()
 
 def extract_diff_and_spec(text: str) -> tuple[str, str]:
-    """Вынимает diff-блоки (```diff ... ```), остальное — SPEC.
-       Если явных блоков нет, но тело похоже на unified diff — считаем всё diff'ом."""
     diff_parts: list[str] = []
-
     def _grab(m: re.Match) -> str:
         diff_parts.append(m.group(2).strip())
         return ""
-
     text_wo = DIFF_BLOCK_RE.sub(_grab, text)
     diff_text = "\n\n".join(diff_parts).strip()
-
     if not diff_text and (GIT_DIFF_HINT_RE.search(text_wo) or UNIFIED_DIFF_HINT_RE.search(text_wo)):
         return "", text_wo.strip()
     return text_wo.strip(), diff_text
 
 PLACEHOLDER_HINT = "created via /create"
-
 def _is_placeholder_or_empty(content: str) -> bool:
-    if not content.strip():
-        return True
-    if PLACEHOLDER_HINT in content:
-        return True
+    if not content.strip(): return True
+    if PLACEHOLDER_HINT in content: return True
     return len(content.strip()) < 8
 
-# ---------- PROMPT-ADAPTER V3 (статический шаблон) ----------
+# ---------- PROMPT-ADAPTER V3 шаблон ----------
 PROMPT_ADAPTER_V3 = r"""[PROMPT-ADAPTER v3 — EN-adapt, API-ready]
 
 [STATIC RULES — cacheable]
@@ -241,7 +240,6 @@ Construct and return ONE JSON object strictly matching OUTPUT SCHEMA, with devel
 """
 
 def _build_context_block(chat_id: int, filename: str) -> str:
-    """Формирует блок CONTEXT с текущим файлом (если есть)."""
     lp = latest_path(chat_id, filename)
     if not lp.exists():
         return ""
@@ -256,16 +254,14 @@ def _build_context_block(chat_id: int, filename: str) -> str:
     reraise=True
 )
 def _openai_create(model: str, input_payload):
-    # Унифицированный вызов Responses API с таймаутом
-    return client.with_options(timeout=REQUEST_TIMEOUT).responses.create(
+    return OpenAI(api_key=os.getenv("OPENAI_API_KEY")).with_options(timeout=REQUEST_TIMEOUT).responses.create(
         model=model,
         input=input_payload,
         max_output_tokens=4096,
         temperature=0.2,
     )
 
-def _call_adapter(raw_task: str, context_block: str, mode_tag: str) -> dict:
-    """Шаг 1: вызываем PROMPT-ADAPTER v3 и получаем JSON-объект."""
+def _call_adapter(raw_task: str, context_block: str, mode_tag: str, output_pref: str) -> dict:
     adapter_prompt = PROMPT_ADAPTER_V3.format(
         RAW_TASK=raw_task,
         CONTEXT=context_block or "(none)",
@@ -273,59 +269,39 @@ def _call_adapter(raw_task: str, context_block: str, mode_tag: str) -> dict:
         TARGETS=ADAPTER_TARGETS,
         CONSTRAINTS=ADAPTER_CONSTRAINTS,
         TEST_POLICY=ADAPTER_TEST_POLICY,
-        OUTPUT_PREF=ADAPTER_OUTPUT_PREF,
+        OUTPUT_PREF=output_pref,
         OUTPUT_LANG=ADAPTER_OUTPUT_LANG,
     )
     resp = _openai_create(ADAPTER_MODEL, adapter_prompt)
     text = getattr(resp, "output_text", None) or extract_code(str(resp))
-    # Строгий парсинг JSON
     try:
         return json.loads(text)
     except Exception:
-        # Попробуем вытащить JSON из кода-блока
         inner = extract_code(text)
         return json.loads(inner)
 
 def _call_codegen_from_messages(messages: list[dict]) -> str:
-    """Шаг 2: отправляем messages в GPT-5 и получаем текстовый ответ (JSON/diff/файлы)."""
-    # Responses API принимает массив с ролями
     resp = _openai_create(CODEGEN_MODEL, messages)
     return getattr(resp, "output_text", None) or extract_code(str(resp))
 
 def _apply_files_json(chat_id: int, active_filename: str, files_obj: list[dict]) -> Path:
-    """
-    Применяет {files:[{path,content}]}:
-    - записывает каждую пару path/content в папку чата,
-    - для active_filename — обновляет latest-* и версионирует,
-    - если active_filename не найден, берём первый файл как активный.
-    """
     active_written = None
     for item in files_obj:
-        path = item.get("path")
+        path = (item.get("path") or "").strip().lstrip("/\\")
         content = item.get("content", "")
         if not path:
             continue
-        # нормализуем относительный путь
-        path = path.strip().lstrip("/\\")
-        # целевой файл: внутри папки чата
         out_path = chat_dir(chat_id) / path
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(content, encoding="utf-8")
-
         if Path(path).name == active_filename:
-            # обновляем latest-* этой сущности
             active_written = version_current_file(chat_id, active_filename, content)
-
     if active_written is None and files_obj:
-        # нет точного совпадения по имени — возьмём первый
         first = files_obj[0]
-        path = first.get("path", active_filename)
-        content = first.get("content", "")
-        active_written = version_current_file(chat_id, active_filename, content)
-
+        active_written = version_current_file(chat_id, active_filename, first.get("content", ""))
     return active_written or latest_path(chat_id, active_filename)
 
-# ---------- AUDIT LOG (SQLite) ----------
+# ---------- AUDIT LOG ----------
 AUDIT_DB = OUTPUT_DIR / "audit.db"
 
 def _audit_connect():
@@ -359,15 +335,9 @@ def _file_meta(path: Optional[Path]) -> tuple[Optional[str], Optional[int]]:
     h = _sha256_file(path)
     return h, b
 
-def audit_event(
-    chat_id: int,
-    event_type: str,
-    active_file: Optional[str] = None,
-    model: Optional[str] = None,
-    prompt: Optional[str] = None,
-    output_path: Optional[Path] = None,
-    meta: Optional[dict] = None,
-):
+def audit_event(chat_id: int, event_type: str, active_file: Optional[str] = None,
+                model: Optional[str] = None, prompt: Optional[str] = None,
+                output_path: Optional[Path] = None, meta: Optional[dict] = None):
     conn = _audit_connect()
     try:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -381,7 +351,7 @@ def audit_event(
     finally:
         conn.close()
 
-# ---------- СОСТОЯНИЕ ГРАФА ----------
+# ---------- СОСТОЯНИЕ ----------
 class InMsg(BaseModel):
     chat_id: int
     text: str
@@ -464,6 +434,16 @@ def node_reset(state: GraphState) -> GraphState:
     audit_event(state["chat_id"], "RESET")
     return state
 
+def _infer_output_pref(raw_text: str, has_context: bool) -> str:
+    if has_context and (DIFF_BLOCK_RE.search(raw_text) or UNIFIED_DIFF_HINT_RE.search(raw_text) or GIT_DIFF_HINT_RE.search(raw_text)):
+        return "UNIFIED_DIFF"
+    return ADAPTER_OUTPUT_PREF
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(1, 1, 8), retry=retry_if_exception_type(Exception), reraise=True)
+def _openai_create_simple(model: str, prompt: str) -> str:
+    resp = client.with_options(timeout=REQUEST_TIMEOUT).responses.create(model=model, input=prompt, max_output_tokens=4096, temperature=0.2)
+    return getattr(resp, "output_text", None) or extract_code(str(resp))
+
 def node_generate(state: GraphState) -> GraphState:
     chat_id = state["chat_id"]
     active = state.get("active_file")
@@ -475,32 +455,31 @@ def node_generate(state: GraphState) -> GraphState:
     model = state.get("model") or DEFAULT_MODEL
     raw_user_text = state["input_text"]
 
-    # Определяем режим: если файл реально существует и не плейсхолдер — EDIT контекст включаем
     lp = latest_path(chat_id, active)
     existed_before = lp.exists()
     ensure_latest_placeholder(chat_id, active, detect_language(active))
     current_text = latest_path(chat_id, active).read_text(encoding="utf-8") if latest_path(chat_id, active).exists() else ""
 
     language = detect_language(active)
-    # Контекст для адаптера
-    context_block = _build_context_block(chat_id, active) if existed_before and not _is_placeholder_or_empty(current_text) else ""
-    mode_tag = "DIFF_PATCH" if context_block else "NEW_FILE"
+    has_context = existed_before and not _is_placeholder_or_empty(current_text)
+    context_block = _build_context_block(chat_id, active) if has_context else ""
+    mode_tag = "DIFF_PATCH" if has_context else "NEW_FILE"
+    output_pref = _infer_output_pref(raw_user_text, has_context)
 
-    # Шаг 1: PROMPT-ADAPTER v3 -> JSON
-    adapter_obj = _call_adapter(raw_user_text, context_block, mode_tag)
-
-    # Шаг 2: codegen из messages (developer+user)
+    # Шаг 1: PROMPT-ADAPTER -> JSON с messages+контрактом
+    adapter_obj = _call_adapter(raw_user_text, context_block, mode_tag, output_pref)
     messages = adapter_obj.get("messages") or []
     if not messages:
         raise RuntimeError("Adapter returned empty messages")
+
+    # Шаг 2: Codegen
     codegen_text = _call_codegen_from_messages(messages)
 
-    # По умолчанию ждём FILES_JSON (как наиболее безопасный вариант)
-    mode = (adapter_obj.get("response_contract") or {}).get("mode", ADAPTER_OUTPUT_PREF)
+    # Применение результата
+    mode = (adapter_obj.get("response_contract") or {}).get("mode", output_pref)
     updated_path = None
 
     if (mode or "").upper() == "FILES_JSON":
-        # Парсим JSON
         try:
             obj = json.loads(codegen_text)
         except Exception:
@@ -509,20 +488,18 @@ def node_generate(state: GraphState) -> GraphState:
         updated_path = _apply_files_json(chat_id, active, files)
 
     elif (mode or "").upper() == "UNIFIED_DIFF":
-        # На будущее: если решим поддержать патчи. Пока аккуратно фоллбэчим на полный файл.
-        # Попробуем вытащить полный код из блока; если не выйдет — пишем как есть.
+        # TODO: можно подключить настоящий патч-апплайер; сейчас фоллбэк на полный файл
         code = extract_code(codegen_text)
         updated_path = version_current_file(chat_id, active, code)
 
     else:
-        # Неожиданный режим — фоллбэк: извлечь кодовый блок и записать целиком.
         code = extract_code(codegen_text)
         updated_path = version_current_file(chat_id, active, code)
 
     rel = latest_path(chat_id, active).relative_to(OUTPUT_DIR)
     state["reply_text"] = (
         f"🧩 Обновил `{active}` через PROMPT-ADAPTER v3\n"
-        f"Контракт: `{(mode or ADAPTER_OUTPUT_PREF)}` → latest: `{rel}`\n"
+        f"Контракт: `{(mode or output_pref)}` → latest: `{rel}`\n"
         f"Отправь следующий промпт/дифф или `/files`."
     )
     audit_event(
@@ -530,7 +507,7 @@ def node_generate(state: GraphState) -> GraphState:
         active_file=active, model=model,
         prompt=json.dumps(adapter_obj, ensure_ascii=False)[:4000],
         output_path=updated_path,
-        meta={"adapter_mode": mode_tag, "contract_mode": mode or ADAPTER_OUTPUT_PREF}
+        meta={"adapter_mode": mode_tag, "contract_mode": mode or output_pref}
     )
     return state
 
@@ -594,7 +571,10 @@ def build_app():
     for node in ("CREATE","SWITCH","FILES","MODEL","RESET","GENERATE","DOWNLOAD"):
         sg.add_edge(node, END)
 
-    checkpointer = SqliteSaver.from_file(OUTPUT_DIR / "langgraph.db")
+    if _CHECKPOINTER_KIND == "sqlite":
+        checkpointer = SqliteSaver.from_file(OUTPUT_DIR / "langgraph.db")
+    else:
+        checkpointer = MemorySaver()
     return sg.compile(checkpointer=checkpointer)
 
 APP = build_app()
