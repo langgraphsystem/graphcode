@@ -378,27 +378,43 @@ def apply_files_json(chat_id: int, active_filename: str, files_obj: List[Dict[st
     return active_written or latest_path(chat_id, active_filename)
 
 # ---------- AUDIT LOGGING ----------
-def audit_event(conn: sqlite3.Connection, chat_id: int, event_type: str, **kwargs) -> None:
-    data = {
-        "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "chat_id": chat_id,
-        "event_type": event_type, "meta": json.dumps(kwargs.pop("meta", {}))
-    }
-    data.update(kwargs)
-    
-    if "output_path" in data and data["output_path"]:
-        p = Path(data["output_path"])
-        if p.exists():
-            data["output_bytes"] = p.stat().st_size
-            data["output_sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
-    
-    cols = ", ".join(data.keys())
-    placeholders = ", ".join("?" for _ in data)
-    conn.execute(f"INSERT INTO events ({cols}) VALUES ({placeholders})", list(data.values()))
-    conn.commit()
+# ИЗМЕНЕНИЕ: Функция теперь сама управляет соединением с БД.
+def audit_event(chat_id: int, event_type: str, **kwargs) -> None:
+    """Manages its own DB connection to log an audit event."""
+    db_path = config.output_dir / "audit.db"
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY, ts TEXT, chat_id INTEGER, event_type TEXT,
+                    active_file TEXT, model TEXT, prompt TEXT, output_path TEXT,
+                    output_sha256 TEXT, output_bytes INTEGER, meta TEXT
+                )
+            """)
+            
+            data = {
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "chat_id": chat_id,
+                "event_type": event_type, "meta": json.dumps(kwargs.pop("meta", {}))
+            }
+            data.update(kwargs)
+            
+            if "output_path" in data and data["output_path"]:
+                p = Path(data["output_path"])
+                if p.exists():
+                    data["output_bytes"] = p.stat().st_size
+                    data["output_sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
+            
+            cols = ", ".join(data.keys())
+            placeholders = ", ".join("?" for _ in data)
+            conn.execute(f"INSERT INTO events ({cols}) VALUES ({placeholders})", list(data.values()))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to log audit event: {e}")
+
 
 # ---------- GRAPH STATE & NODES ----------
 class GraphState(TypedDict, total=False):
-    db: sqlite3.Connection
+    # ИЗМЕНЕНИЕ: Удаляем 'db' из состояния, чтобы оно было сериализуемым.
     chat_id: int
     input_text: str
     command: Command
@@ -435,17 +451,8 @@ def entry_point(state: GraphState) -> GraphState:
     else:
         state["command"] = Command.GENERATE
     
-    # Initialize status messages for the new request
     state["status_msgs"] = []
-    
-    state["db"] = sqlite3.connect(config.output_dir / "audit.db")
-    state["db"].execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY, ts TEXT, chat_id INTEGER, event_type TEXT,
-            active_file TEXT, model TEXT, prompt TEXT, output_path TEXT,
-            output_sha256 TEXT, output_bytes INTEGER, meta TEXT
-        )
-    """)
+    # ИЗМЕНЕНИЕ: Удаляем управление БД из состояния.
     return state
 
 @safe_node
@@ -461,7 +468,7 @@ def node_create_switch(state: GraphState) -> GraphState:
         
     state["active_file"] = filename
     state.setdefault("codegen_model", config.codegen_model_default)
-    audit_event(state["db"], state["chat_id"], state["command"].value, active_file=filename)
+    audit_event(state["chat_id"], state["command"].value, active_file=filename)
     return state
 
 @safe_node
@@ -492,10 +499,10 @@ def node_llm(state: GraphState) -> GraphState:
         return state
         
     state["codegen_model"] = arg
-    audit_event(state["db"], state["chat_id"], "LLM_SET", model=arg)
+    audit_event(state["chat_id"], "LLM_SET", model=arg)
     
     if state.get("pending_messages"):
-        state["command"] = Command.RUN # Re-route to run codegen
+        state["command"] = Command.RUN
         return node_run(state)
     else:
         state["reply_text"] = f"🔧 Codegen model set to: {arg}"
@@ -512,33 +519,32 @@ def node_run(state: GraphState) -> GraphState:
     active_file = state.get("active_file", "main.py")
     model = state.get("codegen_model", config.codegen_model_default)
     mode = state.get("pending_mode", config.adapter_output_pref.value)
-    push_status(state, f"▶️ Запускаю кодогенератор с моделью: {model}") # <-- НОВОЕ СООБЩЕНИЕ
+    push_status(state, f"▶️ Running codegen with model: {model}")
 
     codegen_text = call_codegen(messages, mode=mode, model=model)
     if codegen_text.startswith("# Error"):
         raise ValueError(codegen_text)
     
-    push_status(state, "✔️ Модель-кодогенератор успешно ответила.") # <-- НОВОЕ СООБЩЕНИЕ
+    push_status(state, "✔️ Codegen model responded successfully.")
 
     if mode == "FILES_JSON":
         files_obj = json.loads(extract_code(codegen_text)).get("files", [])
         updated_path = apply_files_json(chat_id, active_file, files_obj)
-    else: # CODE_ONLY or UNIFIED_DIFF (treated as full replacement)
+    else:
         updated_path = version_current_file(chat_id, active_file, extract_code(codegen_text))
     
-    push_status(state, f"✔️ Код успешно применен к файлу: {updated_path.name}") # <-- НОВОЕ СООБЩЕНИЕ
+    push_status(state, f"✔️ Code applied to file: {updated_path.name}")
     
     rel_path = updated_path.relative_to(config.output_dir)
     status_block = "\n".join(f"{i+1}. {line}" for i, line in enumerate(state.get("status_msgs", [])))
     state["reply_text"] = (
-        f"🧭 **Статус выполнения:**\n{status_block}\n\n"
-        f"✅ **Готово!** Файл `{active_file}` обновлен.\n"
-        f"🧩 **Кодогенератор:** `{model}`\n"
-        f"💾 **Сохранено:** `{rel_path}`"
+        f"🧭 **Execution Status:**\n{status_block}\n\n"
+        f"✅ **Done!** File `{active_file}` was updated.\n"
+        f"🧩 **Codegen:** `{model}`\n"
+        f"💾 **Saved:** `{rel_path}`"
     )
-    audit_event(state["db"], chat_id, "GENERATE_SUCCESS", model=model, output_path=str(updated_path))
+    audit_event(chat_id, "GENERATE_SUCCESS", model=model, output_path=str(updated_path))
     
-    # Clear pending state
     state.pop("pending_messages", None)
     state.pop("pending_mode", None)
     return state
@@ -550,7 +556,7 @@ def node_reset(state: GraphState) -> GraphState:
         state.pop(key, None)
     state["codegen_model"] = config.codegen_model_default
     state["reply_text"] = "♻️ State reset."
-    audit_event(state["db"], state["chat_id"], "RESET")
+    audit_event(state["chat_id"], "RESET")
     return state
 
 @safe_node
@@ -558,44 +564,42 @@ def node_generate(state: GraphState) -> GraphState:
     chat_id = state["chat_id"]
     active_file = state.get("active_file")
     if not active_file:
-        state = node_create_switch(state) # Create default file
+        state = node_create_switch(state)
         active_file = state["active_file"]
     
-    push_status(state, f"📩 Получен запрос от пользователя ({len(state['input_text'])} симв.)")
+    push_status(state, f"📩 User request received ({len(state['input_text'])} chars)")
     
     context_block = build_context_block(chat_id, active_file)
     mode_tag = "DIFF_PATCH" if context_block else "NEW_FILE"
-    push_status(state, f"🧠 Вызываю модель-адаптер (режим: {mode_tag})")
+    push_status(state, f"🧠 Calling adapter model (mode: {mode_tag})")
     
     adapter_prompt = render_adapter_prompt(state["input_text"], context_block, mode_tag)
     adapter_result = call_adapter(adapter_prompt)
     
-    # Check if adapter call was successful before proceeding
     if not adapter_result.get("messages"):
-        state["reply_text"] = "❌ Ошибка: Модель-адаптер не смогла обработать запрос. Попробуйте переформулировать."
+        state["reply_text"] = "❌ Error: Adapter model failed to process the request. Please try rephrasing."
         return state
 
-    push_status(state, "✔️ Модель-адаптер успешно ответила.") # <-- НОВОЕ СООБЩЕНИЕ
+    push_status(state, "✔️ Adapter model responded successfully.")
     
     state["pending_messages"] = adapter_result["messages"]
     state["pending_mode"] = adapter_result["response_contract"]["mode"]
     
-    audit_event(state["db"], chat_id, "ADAPTER_READY", model=config.adapter_model)
-    push_status(state, "✅ Структурированный промпт готов к работе.")
+    audit_event(chat_id, "ADAPTER_READY", model=config.adapter_model)
+    push_status(state, "✅ Structured prompt is ready.")
     
     status_block = "\n".join(f"{i+1}. {line}" for i, line in enumerate(state.get("status_msgs", [])))
     state["reply_text"] = (
-        f"🧭 **Статус подготовки:**\n{status_block}\n\n"
-        "**Выберите LLM для генерации кода:**\n"
+        f"🧭 **Preparation Status:**\n{status_block}\n\n"
+        "**Choose a model for code generation:**\n"
         f"→ `/llm <{'|'.join(sorted(VALID_CODEGEN_MODELS))}>`\n"
-        f"→ `/run` (использовать текущую: `{state.get('codegen_model', config.codegen_model_default)}`)"
+        f"→ `/run` (use current: `{state.get('codegen_model', config.codegen_model_default)}`)"
     )
     return state
 
 @safe_node
 def node_download(state: GraphState) -> GraphState:
     chat_id = state["chat_id"]
-    arg = state.get("arg")
     base = chat_dir(chat_id)
     ts = time.strftime("%Y%m%d-%H%M%S")
     out_path = base / f"export-{ts}.zip"
@@ -608,13 +612,12 @@ def node_download(state: GraphState) -> GraphState:
 
     state["file_to_send"] = str(out_path)
     state["reply_text"] = f"📦 Prepared archive: {out_path.name}"
-    audit_event(state["db"], chat_id, "DOWNLOAD", output_path=str(out_path))
+    audit_event(chat_id, "DOWNLOAD", output_path=str(out_path))
     return state
 
 @safe_node
 def exit_point(state: GraphState) -> GraphState:
-    if state.get("db"):
-        state["db"].close()
+    # ИЗМЕНЕНИЕ: Больше не нужно закрывать соединение, так как оно не хранится в состоянии.
     return state
 
 # ---------- GRAPH BUILDER ----------
@@ -633,17 +636,11 @@ def build_app() -> Any:
     sg.add_node("exit", exit_point)
 
     sg.set_entry_point("entry")
-    sg.add_conditional_edges(
-        "entry",
-        lambda state: state["command"].name,
-        {cmd.name: cmd.name for cmd in Command}
-    )
+    sg.add_conditional_edges("entry", lambda state: state["command"].name)
     
-    # After most operations, the graph ends.
     for cmd_name in [c.name for c in Command if c not in [Command.LLM]]:
         sg.add_edge(cmd_name, "exit")
     
-    # Special case: /llm with pending prompt re-routes to /run
     sg.add_conditional_edges(
         Command.LLM.name,
         lambda state: state.get("command", Command.LLM).name,
@@ -660,9 +657,7 @@ def build_app() -> Any:
 
 # ---------- INITIALIZATION ----------
 APP = build_app()
-
 __all__ = ['APP', 'config']
-
 logger.info(
     "Graph app initialized. Adapter: %s. Codegen models: %s. Output dir: %s",
     config.adapter_model, sorted(VALID_CODEGEN_MODELS), config.output_dir
