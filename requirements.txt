@@ -9,10 +9,9 @@ openai>=1.43.0
 langgraph>=0.2.39
 langchain>=0.2.16
 
-# ВАЖНО: отдельный пакет чекпойнтера SQLite (иначе импорта не будет)
+# ВАЖНО: отдельный пакет с SQLite-чекпойнтером
 langgraph-checkpoint-sqlite>=2.0.0
 
 python-dotenv>=1.0.1
 pydantic>=2.7.1
 tenacity>=8.2.3
-
