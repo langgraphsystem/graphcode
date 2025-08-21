@@ -493,9 +493,9 @@ for term in forbidden_terms:
 # ––––– ADAPTER LOGIC –––––
 
 def call_adapter(prompt_text: str) -> Dict[str, Any]:
-“”“Call adapter and return structured prompt.”””
+“”“Call adapter and return structured prompt - FIXED VERSION.”””
 try:
-logger.info(“Calling adapter with correct OpenAI Responses API format”)
+logger.info(“Calling adapter with CORRECT OpenAI Responses API format”)
 
 ```
     # ИСПРАВЛЕННЫЙ вызов OpenAI Responses API
@@ -518,12 +518,14 @@ logger.info(“Calling adapter with correct OpenAI Responses API format”)
     bundle = None
     if hasattr(resp, "output_parsed") and resp.output_parsed:
         bundle = resp.output_parsed
+        logger.info("✅ Got structured response from output_parsed")
     else:
         # Fallback to text parsing
         output_text = getattr(resp, "output_text", "")
         if not output_text:
             raise ValueError("Empty adapter response")
         
+        logger.info("⚠️ Using fallback text parsing")
         try:
             bundle = json.loads(output_text)
         except json.JSONDecodeError:
@@ -597,7 +599,7 @@ messages: List[Dict[str, str]],
 mode: Optional[str] = None,
 model: str = “gpt-5”
 ) -> str:
-“”“Call code generation with specified model.”””
+“”“Call code generation with specified model - FIXED VERSION.”””
 try:
 provider = get_provider_from_model(model)
 
@@ -623,6 +625,7 @@ provider = get_provider_from_model(model)
         
         # ИСПРАВЛЕННЫЙ вызов для кодогенерации
         if mode and mode.upper() == "FILES_JSON":
+            logger.info("Calling codegen with FILES_JSON mode")
             resp = openai_client.responses.create(
                 model=model,
                 instructions="Return ONLY JSON per the schema. Production-grade code; include tests.",
@@ -648,6 +651,7 @@ provider = get_provider_from_model(model)
                 return output_text
         else:
             # For non-JSON modes
+            logger.info(f"Calling codegen with {mode} mode")
             resp = openai_client.responses.create(
                 model=model,
                 instructions=instructions,
