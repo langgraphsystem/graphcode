@@ -799,21 +799,38 @@ def build_application() -> Application:
     
     return app
 
-   # --- ENTRYPOINT ---
-def main() -> None:
-    """Entry point: build app and start polling."""
+      app.post_init = post_init
+    
+    return app
+
+
+# --- ENTRYPOINT (async manual polling) ---
+
+
+async def amain() -> None:
     logger.info(f"Starting bot (Graph: {'✅' if GRAPH_AVAILABLE else '❌'})")
     app = build_application()
-    # post_init уже назначен: app.post_init = post_init
-    # run_polling сам вызывает initialize/start и корректно завершает приложение
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+
+    # initialize() вызовет post_init, если он указан
+    await app.initialize()
+    await app.start()
+    try:
+        # Явно запускаем polling через Updater API PTB 20.x
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+        # Блокируемся до остановки (Ctrl+C/SIGTERM)
+        await app.updater.wait_for_stop()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        logger.info("Bot stopped gracefully")
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(amain())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot terminated by user")
     except Exception as e:
