@@ -40,9 +40,9 @@ from telegram.error import TelegramError, NetworkError, TimedOut
 @dataclass
 class BotConfig:
 token: str
-app_module: str = “graph_app”
-app_name: str = “APP”
-log_level: str = “INFO”
+app_module: str = "graph_app"
+app_name: str = "APP"
+log_level: str = "INFO"
 max_message_length: int = 4096
 typing_delay: float = 0.5
 error_retry_count: int = 3
