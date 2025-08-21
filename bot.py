@@ -805,28 +805,28 @@ def build_application() -> Application:
 
 
 # --- ENTRYPOINT (async manual polling) ---
-
-
 async def amain() -> None:
     logger.info(f"Starting bot (Graph: {'✅' if GRAPH_AVAILABLE else '❌'})")
     app = build_application()
 
-    # initialize() вызовет post_init, если он указан
+    # initialize() вызовет post_init, если он назначен (app.post_init = post_init)
     await app.initialize()
     await app.start()
     try:
-        # Явно запускаем polling через Updater API PTB 20.x
+        # Явный запуск polling через Updater API PTB 20.x — обходит баг run_polling()
         await app.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
         )
-        # Блокируемся до остановки (Ctrl+C/SIGTERM)
+        # Блокируемся до остановки (Ctrl+C / SIGTERM / .stop())
         await app.updater.wait_for_stop()
     finally:
+        # Корректная остановка
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
         logger.info("Bot stopped gracefully")
+
 
 if __name__ == "__main__":
     try:
