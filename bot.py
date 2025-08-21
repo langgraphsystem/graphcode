@@ -49,7 +49,7 @@ error_retry_count: int = 3
 error_retry_delay: float = 1.0
 graph_timeout: float = 60.0
 allowed_users: Optional[List[int]] = None
-checkpoint_ns: str = “prod-bot”
+checkpoint_ns: str = "prod-bot"
 safe_mode: bool = False
 
 ```
@@ -61,7 +61,7 @@ def __post_init__(self):
 # Load configuration from environment
 
 config = BotConfig(
-token=os.environ.get(“TELEGRAM_BOT_TOKEN”, “”),
+token=os.environ.get("TELEGRAM_BOT_TOKEN”, пр“”),
 app_module=os.environ.get(“APP_MODULE”, “graph_app”),
 app_name=os.environ.get(“APP_NAME”, “APP”),
 log_level=os.environ.get(“LOG_LEVEL”, “INFO”).upper(),
