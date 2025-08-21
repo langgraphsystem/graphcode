@@ -799,43 +799,21 @@ def build_application() -> Application:
     
     return app
 
+   # --- ENTRYPOINT ---
+def main() -> None:
+    """Entry point: build app and start polling."""
     logger.info(f"Starting bot (Graph: {'✅' if GRAPH_AVAILABLE else '❌'})")
-    
     app = build_application()
-    
-    await app.initialize()
-    await app.start()
-    
-    try:
-        logger.info("Bot polling started...")
-        await app.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
-        
-        stop_event = asyncio.Event()
-        
-        def signal_handler(signum, frame):
-            logger.info(f"Received signal {signum}")
-            stop_event.set()
-        
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, signal_handler)
-        
-        await stop_event.wait()
-        
-    except Exception as e:
-        logger.critical(f"Critical error: {e}")
-    finally:
-        logger.info("Stopping bot...")
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-        logger.info("Bot stopped gracefully")
+    # post_init уже назначен: app.post_init = post_init
+    # run_polling сам вызывает initialize/start и корректно завершает приложение
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot terminated by user")
     except Exception as e:
