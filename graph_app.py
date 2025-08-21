@@ -753,3 +753,238 @@ def audit_event(
         logger.error(f"Failed to log audit event: {e}")
     finally:
         conn.close()
+
+# ========== SIMPLE GRAPH APP IMPLEMENTATION (ADD TO END OF FILE) ==========
+
+SESSION_FILE = "session.json"
+
+@dataclass
+class Session:
+    active_file: Optional[str] = None
+    model: str = "gpt-5"
+    last_prompt: Optional[str] = None
+
+def _session_path(chat_id: int) -> Path:
+    return chat_dir(chat_id) / SESSION_FILE
+
+def load_session(chat_id: int) -> Session:
+    path = _session_path(chat_id)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return Session(
+                active_file=data.get("active_file"),
+                model=data.get("model", "gpt-5"),
+                last_prompt=data.get("last_prompt"),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load session: {e}")
+    return Session()
+
+def save_session(chat_id: int, s: Session) -> None:
+    path = _session_path(chat_id)
+    try:
+        path.write_text(json.dumps({
+            "active_file": s.active_file,
+            "model": s.model,
+            "last_prompt": s.last_prompt,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"Failed to save session: {e}")
+
+def _zip_chat_dir(chat_id: int) -> Optional[Path]:
+    base = chat_dir(chat_id)
+    zip_path = base / f"chat_{chat_id}.zip"
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            total_size = 0
+            for p in base.rglob("*"):
+                if p.is_file():
+                    bs = p.stat().st_size
+                    total_size += bs
+                    if total_size > config.max_archive_size:
+                        logger.warning("Archive too big, stopping add.")
+                        break
+                    zf.write(p, arcname=p.relative_to(base))
+        return zip_path
+    except Exception as e:
+        logger.error(f"Zip error: {e}")
+        return None
+
+class SimpleGraphApp:
+    """
+    Минимальная синхронная реализация граф-приложения.
+    Ожидает state={"chat_id": int, "input_text": str}
+    """
+    def invoke(self, state: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        chat_id = int(state.get("chat_id"))
+        text: str = (state.get("input_text") or "").strip()
+        if not text:
+            return {"reply_text": "Пустой запрос."}
+
+        session = load_session(chat_id)
+
+        # --- Команды ---
+        if text.startswith("/create"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                return {"reply_text": "Укажи имя файла: /create <filename>"}
+            filename = sanitize_filename(parts[1])
+            lang = detect_language(filename)
+            ensure_latest_placeholder(chat_id, filename, lang)
+            session.active_file = filename
+            save_session(chat_id, session)
+            reply = (
+                f"Структурированный промпт готов для файла `{filename}`.\n"
+                f"Выберите LLM для генерации кода."
+            )
+            return {"reply_text": reply}
+
+        if text.startswith("/switch"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                return {"reply_text": "Укажи имя файла: /switch <filename>"}
+            filename = sanitize_filename(parts[1])
+            path = latest_path(chat_id, filename)
+            if not path.exists():
+                return {"reply_text": f"Файл `{filename}` не найден. Сначала /create {filename}"}
+            session.active_file = filename
+            save_session(chat_id, session)
+            return {"reply_text": f"Текущий файл: `{filename}`"}
+
+        if text.startswith("/files"):
+            names = list_files(chat_id)
+            if not names:
+                return {"reply_text": "Файлов пока нет. Используйте /create <filename>."}
+            lst = "\n".join(f"- {n}" for n in names)
+            return {"reply_text": f"Файлы:\n{lst}"}
+
+        if text.startswith("/model"):
+            return {"reply_text": f"Текущая модель: {session.model}\nДоступные: {', '.join(sorted(VALID_CODEGEN_MODELS))}"}
+
+        if text.startswith("/llm"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                return {"reply_text": f"Укажи модель: /llm <model>\nДоступные: {', '.join(sorted(VALID_CODEGEN_MODELS))}"}
+            model = parts[1].strip()
+            if model not in VALID_CODEGEN_MODELS:
+                return {"reply_text": f"Неизвестная модель: {model}\nДоступные: {', '.join(sorted(VALID_CODEGEN_MODELS))}"}
+            session.model = model
+            save_session(chat_id, session)
+            return {"reply_text": f"Модель установлена: {model}"}
+
+        if text.startswith("/reset"):
+            session = Session()
+            save_session(chat_id, session)
+            return {"reply_text": "Сессия сброшена."}
+
+        if text.startswith("/download"):
+            zp = _zip_chat_dir(chat_id)
+            if not zp or not zp.exists():
+                return {"reply_text": "Не удалось собрать архив."}
+            # bot.py умеет отправлять файл, если сюда передать путь
+            return {"reply_text": f"Готов архив: {zp.name}", "file_to_send": str(zp)}
+
+        if text.startswith("/run"):
+            # запускаем генерацию по последнему запросу пользователя (если он был),
+            # либо сообщаем, что нужно прислать задачу.
+            if not session.active_file:
+                return {"reply_text": "Сначала выбери файл: /create <filename>"}
+            if not session.last_prompt:
+                return {"reply_text": "Пришли текст задачи (без команды), затем /run."}
+            return self._generate(chat_id, session, session.last_prompt)
+
+        # --- Обычный текст: считаем это задачей для генерации ---
+        if not session.active_file:
+            return {"reply_text": "Сначала создай/выбери файл: /create <filename> или /switch <filename>."}
+
+        # Сохраняем последний промпт пользователя
+        session.last_prompt = text
+        save_session(chat_id, session)
+
+        # Подсказка интерфейсу: можно предложить выбрать LLM, если ещё не выбрана
+        if session.model not in VALID_CODEGEN_MODELS:
+            hint = "Выберите LLM для генерации кода."
+        else:
+            hint = "Готово. Используй /run для генерации кода."
+        return {
+            "reply_text": (
+                "Структурированный промпт готов.\n"
+                f"{hint}\n"
+                "Подсказка: /llm gpt-5 или /llm claude-opus-4-1-20250805"
+            )
+        }
+
+    # --- Генерация кода ---
+    def _generate(self, chat_id: int, session: Session, user_task: str) -> Dict[str, Any]:
+        try:
+            filename = session.active_file or "main.py"
+            ctx = build_context_block(chat_id, filename)
+            mode = config.adapter_output_pref.value  # по умолчанию FILES_JSON
+            mode = infer_output_preference(user_task, has_context=bool(ctx))
+
+            # 1) Сформировать адаптированный промпт
+            adapter_prompt = render_adapter_prompt(
+                raw_task=user_task,
+                context_block=ctx,
+                mode_tag=mode,
+                output_pref=mode
+            )
+            adapter_out = call_adapter(adapter_prompt)
+            messages = adapter_out.get("messages", [])
+            response_contract = adapter_out.get("response_contract", {}) or {}
+            mode = (response_contract.get("mode") or mode or "FILES_JSON").upper()
+
+            # 2) Кодогенерация
+            code_output = call_codegen(messages, mode=mode, model=session.model)
+
+            # 3) Применение результата
+            file_to_send: Optional[Path] = None
+            reply_lines: List[str] = []
+
+            if mode == "FILES_JSON":
+                try:
+                    parsed = json.loads(code_output)
+                    files = parsed.get("files", [])
+                    out_path = apply_files_json(chat_id, filename, files)
+                    file_to_send = out_path
+                    reply_lines.append("Код сгенерирован и сохранён (FILES_JSON).")
+                except Exception as e:
+                    logger.error(f"FILES_JSON parse/apply error: {e}")
+                    # как fallback — просто записать в активный файл
+                    out_path = version_current_file(chat_id, filename, code_output)
+                    file_to_send = out_path
+                    reply_lines.append("Не удалось распарсить FILES_JSON, записан raw вывод в активный файл.")
+            else:
+                # Режимы diff/code-only — сейчас записываем как контент в активный файл
+                out_path = version_current_file(chat_id, filename, code_output)
+                file_to_send = out_path
+                reply_lines.append(f"Код сгенерирован в режиме {mode} и записан в `{filename}`.")
+
+            # 4) Аудит
+            try:
+                audit_event(
+                    chat_id=chat_id,
+                    event_type="GENERATE",
+                    active_file=filename,
+                    model=session.model,
+                    prompt=user_task,
+                    output_path=file_to_send,
+                    meta={"mode": mode}
+                )
+            except Exception as e:
+                logger.warning(f"Audit event failed: {e}")
+
+            reply = "\n".join(reply_lines)
+            return {"reply_text": reply, "file_to_send": str(file_to_send) if file_to_send else None}
+
+        except Exception as e:
+            logger.error(f"Generation failed: {e}", exc_info=True)
+            return {"reply_text": f"Ошибка генерации: {e}"}
+
+
+# Экспортируем билдер и объект APP — чтобы bot.py смог их импортировать
+def build_app() -> SimpleGraphApp:
+    return SimpleGraphApp()
+
+APP = build_app()
