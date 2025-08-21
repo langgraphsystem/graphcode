@@ -788,24 +788,23 @@ def build_application() -> Application:
         for cmd in ["create", "switch", "files", "model", "llm", "run", "reset", "download"]:
             app.add_handler(CommandHandler(cmd, on_graph_command))
     
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(on_callback))
+# Callbacks
+app.add_handler(CallbackQueryHandler(on_callback))
     
-    # Error handler
-    app.add_error_handler(on_error)
+# Error handler
+app.add_error_handler(on_error)
     
-    # Lifecycle hooks
-    app.post_init = post_init
-    
-    return app
+# Lifecycle hooks
+app.post_init = post_init
+return app
 
-      app.post_init = post_init
-    
-    return app
+
 # --- ENTRYPOINT (async manual polling) ---
+
 async def amain() -> None:
     logger.info(f"Starting bot (Graph: {'✅' if GRAPH_AVAILABLE else '❌'})")
     app = build_application()
+
     # initialize() вызовет post_init, если он назначен
     await app.initialize()
     await app.start()
@@ -820,6 +819,8 @@ async def amain() -> None:
         await app.stop()
         await app.shutdown()
         logger.info("Bot stopped gracefully")
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(amain())
